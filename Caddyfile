@@ -1,0 +1,3 @@
+plataforma.SEUDOMINIO.com.br {
+    reverse_proxy acella:3000
+}

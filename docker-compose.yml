@@ -1,0 +1,20 @@
+# VPS com Docker: HTTPS automático via Caddy. Veja NUVEM.md
+services:
+  acella:
+    build: .
+    restart: always
+    env_file: .env
+    volumes:
+      - acella-data:/data
+    expose: ["3000"]
+  caddy:
+    image: caddy:2
+    restart: always
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on: [acella]
+volumes:
+  acella-data:
+  caddy-data:
