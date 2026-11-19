@@ -84,6 +84,8 @@ const E=(s,m)=>Object.assign(new Error(m),{status:s});
 const routes=[];const R=(m,p,roles,h)=>routes.push({m,re:new RegExp('^'+p.replace(/:(\w+)/g,'(?<$1>[^/]+)')+'$'),roles,h});
 const tries=new Map();
 const CLIN=['psicologo','assistente_social'];
+/* GEST = gestão administrativa: o administrador e o(a) assistente administrativo(a) (clientes, colaboradores, faturamento, reembolsos de km). O assistente NÃO acessa conteúdo clínico. */
+const GEST=['admin','adm_assist'],isGest=u=>!!u&&GEST.includes(u.role);
 const need=(c,...f)=>f.forEach(k=>{if(c.body[k]==null||c.body[k]==='')throw E(400,'Campo obrigatório: '+k)});
 const pub=u=>({id:u.id,nome:u.nome,email:u.email,usuario:u.usuario,role:u.role,must_change:!!u.must_change,client_id:u.client_id});
 const strong=p=>typeof p==='string'&&(/^\d{6}$/.test(p)||(p.length>=10&&/[a-z]/i.test(p)&&/\d/.test(p)));
@@ -99,13 +101,13 @@ R('GET','/api/me','any',c=>pub(c.u));
 R('POST','/api/password','any',c=>{need(c,'atual','nova');if(!chkPw(c.body.atual,c.u.hash))throw E(403,'Senha atual incorreta.');if(!strong(c.body.nova))throw E(400,'A nova senha deve ter 10+ caracteres, com letras e números.');
  db.prepare('UPDATE users SET hash=?,must_change=0 WHERE id=?').run(hashPw(c.body.nova),c.u.id);db.prepare('DELETE FROM sessions WHERE user_id=? AND tok<>?').run(c.u.id,c.tokHash);audit(c.u,'senha_alterada','',c.ip);return{ok:1}});
 /* ---------- clientes (admin) ---------- */
-R('GET','/api/clients',['admin'],()=>db.prepare('SELECT * FROM clients ORDER BY fantasia').all());
+R('GET','/api/clients',GEST,()=>db.prepare('SELECT * FROM clients ORDER BY fantasia').all());
 const num=(v,max=1e7,dec=2)=>{const n=+String(v??0).replace(',','.');if(!Number.isFinite(n)||n<0||n>max)throw E(400,'Valor numérico inválido.');const f=10**dec;return Math.round(n*f)/f};
 const PLANOS_OK=['Essencial','Equilíbrio','Completo'];
-R('POST','/api/clients',['admin'],c=>{need(c,'cnpj','razao');const b=c.body;
+R('POST','/api/clients',GEST,c=>{need(c,'cnpj','razao');const b=c.body;
  try{const r=db.prepare('INSERT INTO clients(cnpj,razao,fantasia,endereco,responsavel,contato,mensalidade,valor_km,plano,funcionarios,preco_func,inicio_contrato,limite_atend_mes,valor_excedente,criado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(b.cnpj,b.razao,b.fantasia||b.razao,b.endereco||'',b.responsavel||'',b.contato||'',num(b.mensalidade),num(b.valor_km,1e4,4),PLANOS_OK.includes(b.plano)?b.plano:null,Math.round(num(b.funcionarios,1e5,0)),num(b.preco_func,1e4,2),/^\d{4}-\d{2}(-\d{2})?$/.test(b.inicio_contrato||'')?String(b.inicio_contrato).slice(0,7):null,Math.round(num(b.limite_atend_mes,1000,0)),num(b.valor_excedente,1e5,2),now());audit(c.u,'cliente_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}}
  catch(e){if(/UNIQUE/.test(e.message))throw E(409,'Já existe um cliente com este CNPJ.');throw e}});
-R('PATCH','/api/clients/:id',['admin'],c=>{const b={...c.body},f=['razao','fantasia','endereco','responsavel','contato','ativo','mensalidade','valor_km','plano','funcionarios','preco_func','inicio_contrato','limite_atend_mes','valor_excedente'].filter(k=>k in b);if(!f.length)throw E(400,'Nada a alterar');
+R('PATCH','/api/clients/:id',GEST,c=>{const b={...c.body},f=['razao','fantasia','endereco','responsavel','contato','ativo','mensalidade','valor_km','plano','funcionarios','preco_func','inicio_contrato','limite_atend_mes','valor_excedente'].filter(k=>k in b);if(!f.length)throw E(400,'Nada a alterar');
  if('limite_atend_mes' in b)b.limite_atend_mes=Math.round(num(b.limite_atend_mes,1000,0));if('valor_excedente' in b)b.valor_excedente=num(b.valor_excedente,1e5,2);
  if('plano' in b&&!PLANOS_OK.includes(b.plano))b.plano=null;if('funcionarios' in b)b.funcionarios=Math.round(num(b.funcionarios,1e5,0));if('preco_func' in b)b.preco_func=num(b.preco_func,1e4,2);if('inicio_contrato' in b)b.inicio_contrato=/^\d{4}-\d{2}/.test(b.inicio_contrato||'')?String(b.inicio_contrato).slice(0,7):null;
  if('mensalidade' in b)b.mensalidade=num(b.mensalidade);if('valor_km' in b)b.valor_km=num(b.valor_km,1e4,4);
@@ -114,61 +116,67 @@ R('PATCH','/api/clients/:id',['admin'],c=>{const b={...c.body},f=['razao','fanta
    Pessoa = dependente (se o atendimento foi de um dependente) ou colaborador. Atendimentos cancelados não contam.
    GET /api/relatorios/atend-pessoa?ano=2026&mes=11[&client_id=3] */
 const sdec=s=>{try{return dec(s)}catch(e){return''}};
-R('GET','/api/relatorios/atend-pessoa',['admin'],c=>{const hj=new Date(),ano=+c.q.get('ano')||hj.getFullYear(),mes=+c.q.get('mes')||hj.getMonth()+1,cid=+c.q.get('client_id')||0;
- if(mes<1||mes>12||ano<2000||ano>2100)throw E(400,'Mês inválido.');const ym=ano+'-'+String(mes).padStart(2,'0');
- const cl=Object.fromEntries(db.prepare('SELECT id,fantasia,limite_atend_mes,valor_excedente FROM clients').all().map(k=>[k.id,k]));
+/* Contagem por pessoa de um mês. O administrador vê o nome; o(a) assistente administrativo(a) vê só as iniciais (sigilo: quem foi atendido é dado sensível). */
+const iniciais=n=>String(n||'').trim().split(/\s+/).filter(Boolean).map(w=>w[0].toUpperCase()+'.').join(' ')||'—';
+function atendPessoas(ym,cid,verNome){const cl=Object.fromEntries(db.prepare('SELECT id,fantasia,limite_atend_mes,valor_excedente FROM clients').all().map(k=>[k.id,k]));
  const rows=db.prepare(`SELECT a.client_id,COALESCE(a.colab_id,p.colab_id) colab_id,a.dep_id,COUNT(*) qtd,SUM(CASE WHEN a.status IN ('Aprovado','Fechado') THEN 1 ELSE 0 END) validados
   FROM atend a LEFT JOIN prontuarios p ON p.id=a.pront_id WHERE substr(a.data,1,7)=? AND a.status<>'Cancelado'${cid?' AND a.client_id=?':''}
   GROUP BY a.client_id,COALESCE(a.colab_id,p.colab_id),a.dep_id`).all(...(cid?[ym,cid]:[ym]));
- const kn=new Map(),dn=new Map(),nome=(m,sql,id)=>{if(!id)return'';if(!m.has(id)){const r=db.prepare(sql).get(id);m.set(id,r?sdec(r.nome_enc):'')}return m.get(id)};
- const out=rows.map(r=>{const k=cl[r.client_id]||{},lim=k.limite_atend_mes||0,exc=lim?Math.max(0,r.qtd-lim):0,colab=nome(kn,'SELECT nome_enc FROM colaboradores WHERE id=?',r.colab_id),dep=nome(dn,'SELECT nome_enc FROM dependentes WHERE id=?',r.dep_id);
+ const kn=new Map(),dn=new Map(),nome=(m,sql,id)=>{if(!id)return'';if(!m.has(id)){const r=db.prepare(sql).get(id);m.set(id,r?sdec(r.nome_enc):'')}const v=m.get(id);return verNome?v:iniciais(v)};
+ return rows.map(r=>{const k=cl[r.client_id]||{},lim=k.limite_atend_mes||0,exc=lim?Math.max(0,r.qtd-lim):0,colab=nome(kn,'SELECT nome_enc FROM colaboradores WHERE id=?',r.colab_id),dep=nome(dn,'SELECT nome_enc FROM dependentes WHERE id=?',r.dep_id);
   return{client_id:r.client_id,empresa:k.fantasia||'',colab_id:r.colab_id,dep_id:r.dep_id,pessoa:r.dep_id?(dep||'Dependente')+' (dependente de '+(colab||'—')+')':(colab||'Sem identificação'),qtd:r.qtd,validados:r.validados,limite:lim,excedente:exc,valor_excedente:k.valor_excedente||0,valor:Math.round(exc*(k.valor_excedente||0)*100)/100}})
-  .sort((a,b)=>b.excedente-a.excedente||a.empresa.localeCompare(b.empresa)||b.qtd-a.qtd||a.pessoa.localeCompare(b.pessoa));
+  .sort((a,b)=>b.excedente-a.excedente||a.empresa.localeCompare(b.empresa)||b.qtd-a.qtd||a.pessoa.localeCompare(b.pessoa))}
+R('GET','/api/relatorios/atend-pessoa',GEST,c=>{const hj=new Date(),ano=+c.q.get('ano')||hj.getFullYear(),mes=+c.q.get('mes')||hj.getMonth()+1,cid=+c.q.get('client_id')||0;
+ if(mes<1||mes>12||ano<2000||ano>2100)throw E(400,'Mês inválido.');const ym=ano+'-'+String(mes).padStart(2,'0'),out=atendPessoas(ym,cid,c.u.role==='admin');
  audit(c.u,'relatorio_atend_pessoa',ym+(cid?' cliente '+cid:''),c.ip);
- return{ano,mes,pessoas:out,total_atend:out.reduce((s,r)=>s+r.qtd,0),pessoas_acima:out.filter(r=>r.excedente>0).length,total_excedente:out.reduce((s,r)=>s+r.excedente,0),valor_excedente:Math.round(out.reduce((s,r)=>s+r.valor,0)*100)/100}});
+ return{ano,mes,nomes:c.u.role==='admin',pessoas:out,total_atend:out.reduce((s,r)=>s+r.qtd,0),pessoas_acima:out.filter(r=>r.excedente>0).length,total_excedente:out.reduce((s,r)=>s+r.excedente,0),valor_excedente:Math.round(out.reduce((s,r)=>s+r.valor,0)*100)/100}});
 /* ---------- usuários / profissionais (admin) ---------- */
+const ROLES_OK=['admin','adm_assist','psicologo','assistente_social','outro','cliente'];
 R('GET','/api/users',['admin'],()=>db.prepare('SELECT id,nome,email,usuario,tel,role,registro,valor_hora,inicio,ativo,client_id FROM users').all());
 const EMAIL_RE=/^[^@\s]+@[^@\s]+\.[^@\s]+$/,LOGIN_RE=/^[a-z0-9._-]{3,40}$/i;
 const dupMsg='E-mail ou usuário já cadastrado.';
-R('POST','/api/users',['admin'],c=>{need(c,'nome','role','senha_inicial');const b=c.body;if(!['admin','psicologo','assistente_social','outro','cliente'].includes(b.role))throw E(400,'Perfil inválido');
+R('POST','/api/users',['admin'],c=>{need(c,'nome','role','senha_inicial');const b=c.body;if(!ROLES_OK.includes(b.role))throw E(400,'Perfil inválido');
  const email=String(b.email||'').trim(),usuario=String(b.usuario||'').trim();if(!email&&!usuario)throw E(400,'Informe o e-mail ou o usuário de acesso.');
  if(email&&!EMAIL_RE.test(email))throw E(400,'E-mail inválido.');if(usuario&&!LOGIN_RE.test(usuario))throw E(400,'Usuário inválido: use 3 a 40 caracteres (letras, números, ponto, hífen ou sublinhado), sem espaços nem @.');
  if(b.role==='cliente')need(c,'client_id');if(CLIN.includes(b.role))need(c,'registro');if(!strong(b.senha_inicial))throw E(400,'Senha inicial fraca (use 6 dígitos numéricos ou 10+ caracteres com letras e números).');
  const troca=b.exigir_troca===true||b.exigir_troca===1||b.exigir_troca==='1'||b.exigir_troca==='true';
  try{const r=db.prepare('INSERT INTO users(nome,cpf_enc,email,usuario,tel,role,registro,valor_hora,inicio,pagto_enc,hash,must_change,client_id,criado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(String(b.nome).trim(),enc(b.cpf),email||null,usuario||null,b.tel||'',b.role,b.registro||'',+b.valor_hora||0,b.inicio||'',enc(b.pagamento),hashPw(b.senha_inicial),troca?1:0,b.client_id||null,now());audit(c.u,'usuario_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}}
  catch(e){if(/UNIQUE/.test(e.message))throw E(409,dupMsg);throw e}});
-R('PATCH','/api/users/:id',['admin'],c=>{const b={...c.body},f=['nome','tel','registro','valor_hora','ativo','email','usuario','client_id'].filter(k=>k in b);if(!f.length)throw E(400,'Nada a alterar');
+R('PATCH','/api/users/:id',['admin'],c=>{const b={...c.body},f=['nome','tel','registro','valor_hora','ativo','email','usuario','client_id','role'].filter(k=>k in b);if(!f.length)throw E(400,'Nada a alterar');
  const u0=db.prepare('SELECT * FROM users WHERE id=?').get(c.params.id);if(!u0)throw E(404,'Usuário não encontrado.');
+ /* troca de perfil: quem vira Administrador passa a ter exatamente o mesmo acesso do administrador do site. Sempre fica ao menos um administrador ativo. */
+ if('role' in b){if(!ROLES_OK.includes(b.role))throw E(400,'Perfil inválido');if(b.role===u0.role)f.splice(f.indexOf('role'),1);else{if(u0.role==='admin'&&!db.prepare("SELECT 1 FROM users WHERE role='admin' AND ativo=1 AND id<>?").get(u0.id))throw E(400,'Mantenha ao menos um administrador ativo.');if(CLIN.includes(b.role)&&!String(('registro' in b?b.registro:u0.registro)||'').trim())throw E(400,'Informe o registro profissional (CRP/CRESS) para este perfil.');if(b.role==='cliente'&&!('client_id' in b?b.client_id:u0.client_id))throw E(400,'Informe a empresa do perfil Cliente.')}}
+ if(+c.params.id===c.u.id&&'ativo' in b&&!+b.ativo)throw E(400,'Você não pode desativar a si mesmo.');
  if(+c.params.id===c.u.id&&'ativo' in b&&!+b.ativo)throw E(400,'Você não pode desativar a si mesmo.');
  if('email' in b){b.email=String(b.email||'').trim()||null;if(b.email&&!EMAIL_RE.test(b.email))throw E(400,'E-mail inválido.')}
  if('usuario' in b){b.usuario=String(b.usuario||'').trim()||null;if(b.usuario&&!LOGIN_RE.test(b.usuario))throw E(400,'Usuário inválido: use 3 a 40 caracteres (letras, números, ponto, hífen ou sublinhado).')}
  if(('email' in b||'usuario' in b)&&!(('email' in b?b.email:u0.email)||('usuario' in b?b.usuario:u0.usuario)))throw E(400,'Mantenha ao menos o e-mail ou o usuário de acesso.');
  if('client_id' in b)b.client_id=b.client_id?+b.client_id:null;
  try{db.prepare(`UPDATE users SET ${f.map(k=>k+'=?').join(',')} WHERE id=?`).run(...f.map(k=>b[k]),c.params.id)}catch(e){if(/UNIQUE/.test(e.message))throw E(409,dupMsg);throw e}
- if('ativo' in b&&!+b.ativo)db.prepare('DELETE FROM sessions WHERE user_id=?').run(c.params.id);audit(c.u,'usuario_editado',c.params.id+':'+f.join(','),c.ip);return{ok:1}});
+ if(('ativo' in b&&!+b.ativo)||f.includes('role'))db.prepare('DELETE FROM sessions WHERE user_id=?').run(c.params.id);audit(c.u,'usuario_editado',c.params.id+':'+f.join(',')+(f.includes('role')?' ('+u0.role+'>'+b.role+')':''),c.ip);return{ok:1}});
 R('POST','/api/users/:id/reset',['admin'],c=>{need(c,'senha_temporaria');if(!strong(c.body.senha_temporaria))throw E(400,'Senha fraca.');db.prepare('UPDATE users SET hash=?,must_change=1 WHERE id=?').run(hashPw(c.body.senha_temporaria),c.params.id);db.prepare('DELETE FROM sessions WHERE user_id=?').run(c.params.id);audit(c.u,'acesso_redefinido',c.params.id,c.ip);return{ok:1}});
 /* ---------- prontuários: segregação por especialidade, verificada no servidor ---------- */
 const clin=c=>{if(!CLIN.includes(c.u.role)){audit(c.u,'prontuario_negado','',c.ip,0);throw E(403,'Sem acesso a conteúdo clínico.')}};
 const getP=c=>{clin(c);const p=db.prepare('SELECT * FROM prontuarios WHERE id=?').get(c.params.id);if(!p||p.especialidade!==c.u.role){audit(c.u,'prontuario_negado',c.params.id,c.ip,0);throw E(404,'Prontuário não encontrado.')}return p};
 /* ---------- colaboradores, dependentes e prontuários ---------- */
-const PEOPLE=['admin','psicologo','assistente_social'];
+const PEOPLE=['admin','psicologo','assistente_social'],PEOPLE_G=[...PEOPLE,'adm_assist'];
 const IM=require('./importar'),{digits,cpfOk,norm,parseNasc}=IM;
 const cpfH=d=>crypto.createHmac('sha256',KEY).update(digits(d)).digest('hex');
 const maskCpf=d=>{d=digits(d);return d?'•••.•••.•••-'+d.slice(-2):''};
 const today=()=>new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,10),hhmm=()=>new Date().toTimeString().slice(0,5);
 const colabOut=k=>({id:k.id,client_id:k.client_id,nome:dec(k.nome_enc),cpf:maskCpf(dec(k.cpf_enc)),nasc:dec(k.nasc_enc),cargo:k.cargo,ativo:k.ativo});
 /* Lista (padrão: vetor). Com pag=1 devolve {total,itens} paginado e ordenado por nome. Cada empresa é filtrada por client_id. */
-R('GET','/api/colaboradores',PEOPLE,c=>{const q=norm(c.q.get('q')||'').trim(),qd=digits(q),cid=+c.q.get('client_id')||0,only=+c.q.get('id')||0,pag=c.q.get('pag')==='1',lim=Math.min(Math.max(+c.q.get('limit')||100,1),500),off=Math.max(+c.q.get('offset')||0,0);
+R('GET','/api/colaboradores',PEOPLE_G,c=>{const q=norm(c.q.get('q')||'').trim(),qd=digits(q),cid=+c.q.get('client_id')||0,only=+c.q.get('id')||0,pag=c.q.get('pag')==='1',lim=Math.min(Math.max(+c.q.get('limit')||100,1),500),off=Math.max(+c.q.get('offset')||0,0);
  const wh=[cid?'client_id='+cid:'',only?'id='+only:''].filter(Boolean);let rows=db.prepare('SELECT * FROM colaboradores '+(wh.length?'WHERE '+wh.join(' AND '):'')+' ORDER BY id DESC').all().map(k=>({k,nome:dec(k.nome_enc)}));
  if(q)rows=rows.filter(({k,nome})=>norm(nome).includes(q)||(qd.length>=3&&digits(dec(k.cpf_enc)).includes(qd))||norm(k.cargo||'').includes(q));
  const nd=Object.fromEntries(db.prepare('SELECT colab_id k,COUNT(*) n FROM dependentes WHERE ativo=1 AND colab_id IS NOT NULL GROUP BY colab_id').all().map(x=>[x.k,x.n])),out=({k})=>({...colabOut(k),deps:nd[k.id]||0});
  if(!pag)return rows.slice(0,500).map(out);
  rows.sort((a,b)=>norm(a.nome).localeCompare(norm(b.nome)));return{total:rows.length,limit:lim,offset:off,itens:rows.slice(off,off+lim).map(out)}});
-R('POST','/api/colaboradores',PEOPLE,c=>{need(c,'nome','cpf','cargo','client_id');if(!cpfOk(c.body.cpf))throw E(400,'CPF inválido.');if(!db.prepare('SELECT 1 FROM clients WHERE id=? AND ativo=1').get(c.body.client_id))throw E(400,'Empresa inválida.');
+R('POST','/api/colaboradores',PEOPLE_G,c=>{need(c,'nome','cpf','cargo','client_id');if(!cpfOk(c.body.cpf))throw E(400,'CPF inválido.');if(!db.prepare('SELECT 1 FROM clients WHERE id=? AND ativo=1').get(c.body.client_id))throw E(400,'Empresa inválida.');
  const nasc=parseNasc(c.body.nasc);if(nasc===null)throw E(400,'Data de nascimento inválida.');
  const h=cpfH(c.body.cpf);if(db.prepare('SELECT 1 FROM colaboradores WHERE cpf_hash=? AND client_id=?').get(h,c.body.client_id))throw E(409,'Já existe colaborador com este CPF nesta empresa.');
  const r=db.prepare('INSERT INTO colaboradores(client_id,nome_enc,cpf_enc,cpf_hash,cargo,criado,criado_por,nasc_enc) VALUES(?,?,?,?,?,?,?,?)').run(c.body.client_id,enc(String(c.body.nome).trim()),enc(digits(c.body.cpf)),h,String(c.body.cargo).trim(),now(),c.u.id,enc(nasc));audit(c.u,'colaborador_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}});
-R('PATCH','/api/colaboradores/:id',PEOPLE,c=>{const k=db.prepare('SELECT * FROM colaboradores WHERE id=?').get(c.params.id);if(!k)throw E(404,'Colaborador não encontrado.');const b=c.body;if(b.cpf!=null&&b.cpf!==''&&!cpfOk(b.cpf))throw E(400,'CPF inválido.');const ncpf=b.cpf!=null&&b.cpf!=='';
+R('PATCH','/api/colaboradores/:id',PEOPLE_G,c=>{const k=db.prepare('SELECT * FROM colaboradores WHERE id=?').get(c.params.id);if(!k)throw E(404,'Colaborador não encontrado.');const b=c.body;if(b.cpf!=null&&b.cpf!==''&&!cpfOk(b.cpf))throw E(400,'CPF inválido.');const ncpf=b.cpf!=null&&b.cpf!=='';
  let nasc_enc=k.nasc_enc;if(b.nasc!==undefined){const n=parseNasc(b.nasc);if(n===null)throw E(400,'Data de nascimento inválida.');nasc_enc=enc(n)}
  try{db.prepare('UPDATE colaboradores SET nome_enc=?,cpf_enc=?,cpf_hash=?,cargo=?,client_id=?,ativo=?,nasc_enc=? WHERE id=?').run(b.nome?enc(String(b.nome).trim()):k.nome_enc,ncpf?enc(digits(b.cpf)):k.cpf_enc,ncpf?cpfH(b.cpf):k.cpf_hash,b.cargo??k.cargo,b.client_id||k.client_id,b.ativo!=null?+b.ativo:k.ativo,nasc_enc,k.id)}catch(e){if(/UNIQUE/.test(e.message))throw E(409,'Já existe colaborador com este CPF nesta empresa.');throw e}
  audit(c.u,'colaborador_editado',k.id,c.ip);return{ok:1}});
@@ -180,8 +188,8 @@ const depOk=(id,p)=>db.prepare('SELECT id FROM dependentes WHERE id=? AND (colab
 const depDados=b=>{const nome=String(b.nome||'').trim().replace(/\s+/g,' ');if(nome.length<2)throw E(400,'Informe o nome do dependente.');if(b.cpf&&!cpfOk(b.cpf))throw E(400,'CPF do dependente inválido.');const nasc=parseNasc(b.nasc);if(nasc===null)throw E(400,'Data de nascimento do dependente inválida.');return{nome,parentesco:String(b.parentesco||'outro').slice(0,40),nasc,cpf:digits(b.cpf)}};
 const depDup=(colab_id,d,ignorar)=>{if(!colab_id)return false;const h=d.cpf?cpfH(d.cpf):null,n=norm(d.nome);return db.prepare('SELECT * FROM dependentes WHERE colab_id=?').all(colab_id).some(x=>x.id!==ignorar&&((h&&x.cpf_hash===h)||(norm(dec(x.nome_enc))===n&&(!d.nasc||!depNasc(x)||depNasc(x)===d.nasc))))};
 const insDep=(ids,d)=>db.prepare('INSERT INTO dependentes(pront_id,colab_id,nome_enc,parentesco,nasc,nasc_enc,cpf_enc,cpf_hash,criado) VALUES(?,?,?,?,?,?,?,?,?)').run(ids.pront_id||null,ids.colab_id||null,enc(d.nome),d.parentesco,'',enc(d.nasc),enc(d.cpf),d.cpf?cpfH(d.cpf):null,now());
-R('GET','/api/colaboradores/:id/dependentes',PEOPLE,c=>{const k=db.prepare('SELECT id FROM colaboradores WHERE id=?').get(c.params.id);if(!k)throw E(404,'Colaborador não encontrado.');return db.prepare('SELECT * FROM dependentes WHERE colab_id=? ORDER BY id').all(k.id).map(depOut)});
-R('POST','/api/colaboradores/:id/dependentes',PEOPLE,c=>{const k=db.prepare('SELECT id FROM colaboradores WHERE id=?').get(c.params.id);if(!k)throw E(404,'Colaborador não encontrado.');const d=depDados(c.body);
+R('GET','/api/colaboradores/:id/dependentes',PEOPLE_G,c=>{const k=db.prepare('SELECT id FROM colaboradores WHERE id=?').get(c.params.id);if(!k)throw E(404,'Colaborador não encontrado.');return db.prepare('SELECT * FROM dependentes WHERE colab_id=? ORDER BY id').all(k.id).map(depOut)});
+R('POST','/api/colaboradores/:id/dependentes',PEOPLE_G,c=>{const k=db.prepare('SELECT id FROM colaboradores WHERE id=?').get(c.params.id);if(!k)throw E(404,'Colaborador não encontrado.');const d=depDados(c.body);
  if(depDup(k.id,d))throw E(409,'Este dependente já está cadastrado para o colaborador.');const r=insDep({colab_id:k.id},d);audit(c.u,'dependente_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}});
 function openPront(u,k,ip){const ex=db.prepare('SELECT id FROM prontuarios WHERE colab_id=? AND especialidade=?').get(k.id,u.role);if(ex){audit(u,'prontuario_aberto',ex.id,ip);return{id:ex.id,existente:true}}
  const r=db.prepare('INSERT INTO prontuarios(client_id,colab_enc,especialidade,prof_id,aberto_em,colab_id) VALUES(?,?,?,?,?,?)').run(k.client_id,k.nome_enc,u.role,u.id,now(),k.id);audit(u,'prontuario_criado',r.lastInsertRowid,ip);return{id:Number(r.lastInsertRowid),existente:false}}
@@ -202,7 +210,7 @@ R('PATCH','/api/prontuarios/:id',CLIN,c=>{const p=getP(c),b=c.body;if(b.observac
  if(b.situacao){if(!['Em acompanhamento','Encerrado'].includes(b.situacao))throw E(400,'Situação inválida.');db.prepare('UPDATE prontuarios SET situacao=?,encerrado_em=? WHERE id=?').run(b.situacao,b.situacao==='Encerrado'?now():null,p.id)}audit(c.u,'prontuario_editado',p.id,c.ip);return{ok:1}});
 R('POST','/api/prontuarios/:id/dependentes',CLIN,c=>{const p=getP(c);need(c,'nome','parentesco');const d=depDados(c.body);if(depDup(p.colab_id,d))throw E(409,'Este dependente já está cadastrado para o colaborador.');
  const r=insDep({colab_id:p.colab_id,pront_id:p.id},d);audit(c.u,'dependente_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}});
-R('PATCH','/api/dependentes/:id',PEOPLE,c=>{const d=db.prepare('SELECT * FROM dependentes WHERE id=?').get(c.params.id);if(!d)throw E(404,'Dependente não encontrado.');
+R('PATCH','/api/dependentes/:id',PEOPLE_G,c=>{const d=db.prepare('SELECT * FROM dependentes WHERE id=?').get(c.params.id);if(!d)throw E(404,'Dependente não encontrado.');
  if(!d.colab_id){const p=d.pront_id&&db.prepare('SELECT especialidade FROM prontuarios WHERE id=?').get(d.pront_id);if(!p||p.especialidade!==c.u.role)throw E(404,'Dependente não encontrado.')}
  const b=c.body;if(b.cpf&&!cpfOk(b.cpf))throw E(400,'CPF inválido.');const nasc=b.nasc===undefined?depNasc(d):parseNasc(b.nasc);if(nasc===null)throw E(400,'Data de nascimento inválida.');
  db.prepare('UPDATE dependentes SET nome_enc=?,parentesco=?,nasc=?,nasc_enc=?,cpf_enc=?,cpf_hash=?,ativo=? WHERE id=?').run(b.nome?enc(String(b.nome).trim()):d.nome_enc,b.parentesco||d.parentesco,'',enc(nasc),b.cpf?enc(digits(b.cpf)):d.cpf_enc,b.cpf?cpfH(b.cpf):d.cpf_hash,b.ativo!=null?+b.ativo:d.ativo,d.id);audit(c.u,'dependente_editado',d.id,c.ip);return{ok:1}});
@@ -318,7 +326,7 @@ function results(k){const F=db.prepare('SELECT perguntas,metrica FROM forms WHER
 R('GET','/api/campaigns/:id/results',['admin','cliente'],c=>{const k=db.prepare('SELECT c.*,cl.fantasia FROM campaigns c JOIN clients cl ON cl.id=c.client_id WHERE c.id=?').get(c.params.id);if(!k||(c.u.role==='cliente'&&k.client_id!==c.u.client_id))throw E(404,'Campanha não encontrada.');return results(k)});
 R('GET','/api/client/dashboard',['cliente'],c=>{const ks=db.prepare('SELECT * FROM campaigns WHERE client_id=?').all(c.u.client_id),a=db.prepare("SELECT substr(data,1,7) mes,COUNT(*) qtd FROM atend WHERE client_id=? AND status IN ('Aprovado','Fechado') GROUP BY 1 ORDER BY 1").all(c.u.client_id);
  return{pesquisas:ks.map(results),atendimentos_total:a.reduce((s,x)=>s+x.qtd,0),atendimentos_por_mes:a}});
-R('GET','/api/clients/lista',['admin','psicologo','assistente_social'],()=>db.prepare('SELECT id,fantasia,valor_km FROM clients WHERE ativo=1 ORDER BY fantasia').all());
+R('GET','/api/clients/lista',PEOPLE_G,()=>db.prepare('SELECT id,fantasia,valor_km FROM clients WHERE ativo=1 ORDER BY fantasia').all());
 R('GET','/api/campaigns',['admin'],()=>db.prepare('SELECT c.*,cl.fantasia,(SELECT COUNT(*) FROM responses r WHERE r.campaign_id=c.id) respostas FROM campaigns c JOIN clients cl ON cl.id=c.client_id ORDER BY c.id DESC').all());
 R('PUT','/api/forms/:id',['admin'],c=>{const f=db.prepare('SELECT * FROM forms WHERE id=?').get(c.params.id);if(!f)throw E(404,'Formulário não encontrado');
  if(db.prepare('SELECT 1 FROM responses r JOIN campaigns k ON k.id=r.campaign_id WHERE k.form_id=?').get(f.id))throw E(409,'Este formulário já tem respostas e não pode ser alterado, para não distorcer os resultados. Salve como uma nova cópia.');
@@ -404,7 +412,7 @@ function clientData(cid){const cl=db.prepare('SELECT fantasia,razao FROM clients
  const ps=db.prepare('SELECT * FROM campaigns WHERE client_id=? ORDER BY id').all(cid).map(k=>({...results(k),validade:k.validade})),
  at=db.prepare("SELECT substr(data,1,7) mes,COUNT(*) qtd FROM atend WHERE client_id=? AND status IN ('Aprovado','Fechado') GROUP BY 1 ORDER BY 1").all(cid).map(a=>({mes:a.mes,qtd:a.qtd<3?'<3':a.qtd}));return{cl,ps,at}}
 const cidOf=c=>c.u.role==='cliente'?c.u.client_id:+c.q.get('client_id');
-R('GET','/api/export/clientes.xlsx',['admin'],c=>FX(c,'clientes.xlsx',[{nome:'Clientes',cols:[{h:'CNPJ',w:20},{h:'Razão social',w:34},{h:'Nome fantasia',w:26},{h:'Responsável',w:24},{h:'Contato',w:28},{h:'Endereço',w:36},{h:'Mensalidade',t:'m'},{h:'Valor do km',t:'m'},{h:'Situação',w:10},{h:'Cadastro',t:'d'}],rows:db.prepare('SELECT * FROM clients ORDER BY fantasia').all().map(k=>[k.cnpj,k.razao,k.fantasia,k.responsavel,k.contato,k.endereco,k.mensalidade,k.valor_km,k.ativo?'Ativo':'Inativo',k.criado])}]));
+R('GET','/api/export/clientes.xlsx',GEST,c=>FX(c,'clientes.xlsx',[{nome:'Clientes',cols:[{h:'CNPJ',w:20},{h:'Razão social',w:34},{h:'Nome fantasia',w:26},{h:'Responsável',w:24},{h:'Contato',w:28},{h:'Endereço',w:36},{h:'Mensalidade',t:'m'},{h:'Valor do km',t:'m'},{h:'Situação',w:10},{h:'Cadastro',t:'d'}],rows:db.prepare('SELECT * FROM clients ORDER BY fantasia').all().map(k=>[k.cnpj,k.razao,k.fantasia,k.responsavel,k.contato,k.endereco,k.mensalidade,k.valor_km,k.ativo?'Ativo':'Inativo',k.criado])}]));
 R('GET','/api/export/pesquisas.xlsx',['admin'],c=>{const ks=db.prepare('SELECT c.*,cl.fantasia FROM campaigns c JOIN clients cl ON cl.id=c.client_id ORDER BY c.id').all(),rs=ks.map(k=>({k,r:results(k)}));
  return FX(c,'pesquisas.xlsx',[{nome:'Campanhas',cols:[{h:'Campanha',w:28},{h:'Empresa',w:26},{h:'Criada em',t:'d'},{h:'Validade',t:'d'},{h:'Convidados',t:'n'},{h:'Respostas',t:'n'},{h:'Participação (%)',t:'n'},{h:'Participação única'}],rows:rs.map(({k,r})=>[k.nome,k.fantasia,k.criado,k.validade,k.convidados,r.respostas,r.participacao,k.unica?'Sim':'Não'])},{nome:'Resultados consolidados',cols:RC,rows:rs.flatMap(({k,r})=>resRows(r,k.fantasia))}])});
 R('GET','/api/export/atendimentos.xlsx',['admin','psicologo','assistente_social'],c=>{const adm=c.u.role==='admin',l=db.prepare(`SELECT a.*,u.nome prof,u.role prole,cl.fantasia emp FROM atend a JOIN users u ON u.id=a.prof_id JOIN clients cl ON cl.id=a.client_id ${adm?'':'WHERE a.prof_id='+c.u.id} ORDER BY a.data,a.inicio`).all(),g={};
@@ -507,9 +515,9 @@ const dtBR=s=>s?String(s).slice(0,10).split('-').reverse().join('/'):'';
 const ymOf=(a,m)=>a+'-'+String(m).padStart(2,'0');
 const getCl=id=>{const cl=db.prepare('SELECT * FROM clients WHERE id=?').get(id);if(!cl)throw E(400,'Cliente inválido.');return cl};
 const fatDoMes=(cid,ym)=>db.prepare('SELECT * FROM faturamentos WHERE client_id=? AND ano=? AND mes=?').get(cid,+ym.slice(0,4),+ym.slice(5,7));
-R('GET','/api/despesas',['admin'],c=>{const cid=+c.q.get('client_id')||0,ab=c.q.get('abertas')==='1',ym=c.q.get('mes')||'';
+R('GET','/api/despesas',GEST,c=>{const cid=+c.q.get('client_id')||0,ab=c.q.get('abertas')==='1',ym=c.q.get('mes')||'';
  return db.prepare(`SELECT d.*,cl.fantasia FROM despesas d JOIN clients cl ON cl.id=d.client_id WHERE 1=1${cid?' AND d.client_id='+cid:''}${ab?' AND d.fat_id IS NULL':''}${/^\d{4}-\d\d$/.test(ym)?" AND substr(d.data,1,7)='"+ym+"'":''} ORDER BY d.data DESC,d.id DESC`).all()});
-R('POST','/api/despesas',['admin'],c=>{need(c,'client_id','data','tipo');const b=c.body,cl=getCl(b.client_id);
+R('POST','/api/despesas',GEST,c=>{need(c,'client_id','data','tipo');const b=c.body,cl=getCl(b.client_id);
  if(!/^\d{4}-\d\d-\d\d$/.test(b.data))throw E(400,'Data inválida.');if(!TIPOS_DESP[b.tipo])throw E(400,'Tipo de despesa inválido.');
  if(b.tipo==='km')throw E(400,'O reembolso de km é lançado pelo profissional na aba Reembolsos e aprovado pelo administrador. Aqui lance apenas pedágios e outras despesas.');
  if(fatDoMes(cl.id,b.data.slice(0,7)))throw E(423,'O mês desta despesa já foi fechado para este cliente.');
@@ -518,7 +526,7 @@ R('POST','/api/despesas',['admin'],c=>{need(c,'client_id','data','tipo');const b
  else{valor=num(b.valor);if(!(valor>0))throw E(400,'Informe o valor da despesa.')}
  const desc=String(b.descricao||'').trim().slice(0,200)||(b.tipo==='km'?'Km rodado: '+km+' km × '+fmtBRL(vkm):TIPOS_DESP[b.tipo]);
  const r=db.prepare('INSERT INTO despesas(client_id,data,tipo,descricao,km,valor_km,valor,criado,criado_por) VALUES(?,?,?,?,?,?,?,?,?)').run(cl.id,b.data,b.tipo,desc,km,vkm,valor,now(),c.u.id);audit(c.u,'despesa_lancada',r.lastInsertRowid+':'+cl.id,c.ip);return{id:Number(r.lastInsertRowid),valor,descricao:desc}});
-R('DELETE','/api/despesas/:id',['admin'],c=>{const d=db.prepare('SELECT * FROM despesas WHERE id=?').get(c.params.id);if(!d)throw E(404,'Despesa não encontrada.');if(d.fat_id)throw E(423,'Despesa já incluída em um fechamento.');
+R('DELETE','/api/despesas/:id',GEST,c=>{const d=db.prepare('SELECT * FROM despesas WHERE id=?').get(c.params.id);if(!d)throw E(404,'Despesa não encontrada.');if(d.fat_id)throw E(423,'Despesa já incluída em um fechamento.');
  db.prepare('DELETE FROM despesas WHERE id=?').run(d.id);audit(c.u,'despesa_excluida',d.id,c.ip);return{ok:1}});
 /* ---------- reembolsos de km ----------
    Fluxo: o(a) profissional (psicólogo, assistente social ou administrador) LANÇA  →  o administrador APROVA ou rejeita  →
@@ -530,7 +538,7 @@ const R2=v=>Math.round((+v||0)*100)/100;
 const REEMB_SQL='SELECT r.*,u.nome prof,u.role prole,cl.fantasia,f.ano fech_ano,f.mes fech_mes,f.pago_em fech_pago,d.nome decisor,fa.ano fat_ano,fa.mes fat_mes,fa.status fat_status FROM reembolsos r JOIN users u ON u.id=r.prof_id JOIN clients cl ON cl.id=r.client_id LEFT JOIN fechamentos f ON f.id=r.fech_id LEFT JOIN users d ON d.id=r.decidido_por LEFT JOIN faturamentos fa ON fa.id=r.fat_id';
 const reembOut=(r,adm)=>{const o={id:r.id,prof_id:r.prof_id,prof:r.prof,prole:r.prole,client_id:r.client_id,fantasia:r.fantasia,data:r.data,km:r.km,valor_km:r.valor_km,valor:r.valor,descricao:r.descricao,status:r.status,motivo:r.motivo,decidido_em:r.decidido_em,decisor:r.decisor,fech_id:r.fech_id,fech_ano:r.fech_ano,fech_mes:r.fech_mes,pago_em:r.fech_pago,criado:r.criado};
  if(adm){o.fat_id=r.fat_id;o.fat_ano=r.fat_ano;o.fat_mes=r.fat_mes;o.fat_status=r.fat_status}return o};
-R('GET','/api/reembolsos',PEOPLE,c=>{const adm=c.u.role==='admin',w=[],a=[];
+R('GET','/api/reembolsos',PEOPLE_G,c=>{const adm=isGest(c.u),w=[],a=[];
  if(!adm){w.push('r.prof_id=?');a.push(c.u.id)}else{const p=+c.q.get('prof_id')||0;if(p){w.push('r.prof_id=?');a.push(p)}}
  const cid=+c.q.get('client_id')||0;if(cid){w.push('r.client_id=?');a.push(cid)}
  const s=c.q.get('status')||'';if(['Pendente','Aprovado','Rejeitado'].includes(s)){w.push('r.status=?');a.push(s)}
@@ -553,17 +561,17 @@ R('PATCH','/api/reembolsos/:id',PEOPLE,c=>{const r=getReemb(c.params.id);if(r.pr
  const b={client_id:r.client_id,data:r.data,km:r.km,descricao:r.descricao,...c.body},v=reembValida(c,b,r.id);
  db.prepare("UPDATE reembolsos SET client_id=?,data=?,km=?,valor_km=?,valor=?,descricao=?,status='Pendente',motivo=NULL,decidido_por=NULL,decidido_em=NULL,alterado=? WHERE id=?").run(v.cl.id,b.data,v.km,v.vkm,v.valor,v.desc,now(),r.id);
  audit(c.u,'reembolso_alterado',r.id,c.ip);return{ok:1,valor:v.valor}});
-R('DELETE','/api/reembolsos/:id',PEOPLE,c=>{const r=getReemb(c.params.id);if(r.prof_id!==c.u.id&&c.u.role!=='admin')throw E(403,'Sem permissão para excluir este reembolso.');
+R('DELETE','/api/reembolsos/:id',PEOPLE_G,c=>{const r=getReemb(c.params.id);if(r.prof_id!==c.u.id&&!isGest(c.u))throw E(403,'Sem permissão para excluir este reembolso.');
  if(r.status==='Aprovado'||r.fech_id)throw E(423,'Reembolso aprovado não pode ser excluído. O administrador pode desfazer a aprovação antes.');
  db.prepare('DELETE FROM reembolsos WHERE id=?').run(r.id);audit(c.u,'reembolso_excluido',r.id,c.ip);return{ok:1}});
 const reembDecide=(c,r,status,motivo)=>{db.prepare('UPDATE reembolsos SET status=?,motivo=?,decidido_por=?,decidido_em=? WHERE id=?').run(status,motivo||null,c.u.id,now(),r.id);audit(c.u,'reembolso_'+status.toLowerCase(),r.id,c.ip)};
-R('POST','/api/reembolsos/aprovar-lote',['admin'],c=>{const ids=Array.isArray(c.body.ids)?c.body.ids.map(Number):null;let n=0,v=0;
+R('POST','/api/reembolsos/aprovar-lote',GEST,c=>{const ids=Array.isArray(c.body.ids)?c.body.ids.map(Number):null;let n=0,v=0;
  db.exec('BEGIN');try{for(const r of db.prepare("SELECT * FROM reembolsos WHERE status='Pendente'").all()){if(ids&&!ids.includes(r.id))continue;reembDecide(c,r,'Aprovado');n++;v+=r.valor}db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}
  return{aprovados:n,valor:R2(v)}});
-R('POST','/api/reembolsos/:id/aprovar',['admin'],c=>{const r=getReemb(c.params.id);if(r.status==='Aprovado')throw E(409,'Reembolso já aprovado.');reembDecide(c,r,'Aprovado');return{ok:1}});
-R('POST','/api/reembolsos/:id/rejeitar',['admin'],c=>{const r=getReemb(c.params.id);if(r.status!=='Pendente')throw E(409,'Só é possível rejeitar reembolsos pendentes. Para um já aprovado, desfaça a aprovação antes.');
+R('POST','/api/reembolsos/:id/aprovar',GEST,c=>{const r=getReemb(c.params.id);if(r.status==='Aprovado')throw E(409,'Reembolso já aprovado.');reembDecide(c,r,'Aprovado');return{ok:1}});
+R('POST','/api/reembolsos/:id/rejeitar',GEST,c=>{const r=getReemb(c.params.id);if(r.status!=='Pendente')throw E(409,'Só é possível rejeitar reembolsos pendentes. Para um já aprovado, desfaça a aprovação antes.');
  const m=String(c.body.motivo||'').trim();if(m.length<5)throw E(400,'Informe o motivo da rejeição (mínimo de 5 caracteres): quem lançou verá a justificativa.');reembDecide(c,r,'Rejeitado',m.slice(0,300));return{ok:1}});
-R('POST','/api/reembolsos/:id/desfazer',['admin'],c=>{const r=getReemb(c.params.id);if(r.status!=='Aprovado')throw E(409,'Só reembolsos aprovados podem ter a aprovação desfeita.');if(r.fech_id)throw E(423,'Este reembolso já está em um fechamento de profissional.');
+R('POST','/api/reembolsos/:id/desfazer',GEST,c=>{const r=getReemb(c.params.id);if(r.status!=='Aprovado')throw E(409,'Só reembolsos aprovados podem ter a aprovação desfeita.');if(r.fech_id)throw E(423,'Este reembolso já está em um fechamento de profissional.');
  db.prepare("UPDATE reembolsos SET status='Pendente',motivo=NULL,decidido_por=NULL,decidido_em=NULL WHERE id=?").run(r.id);audit(c.u,'reembolso_aprovacao_desfeita',r.id,c.ip);return{ok:1}});
 /* Cálculo do fechamento do cliente: mensalidade + despesas em aberto do mês + quantidade de atendimentos validados */
 function faturaCalc(cl,ano,mes){const ym=ymOf(ano,mes),
@@ -581,7 +589,7 @@ function faturaCalc(cl,ano,mes){const ym=ymOf(ano,mes),
  return{client_id:cl.id,cliente:cl.fantasia,razao:cl.razao,cnpj:cl.cnpj,ano,mes,mensalidade:mens,despesas:dsp,reembolsos:rbv,custo_prof:custo,reembolsos_aguardando:{pendentes:ag.pend,aprovados:ag.apr,valor:R2(ag.v)},total:Math.round((mens+dsp)*100)/100,itens,pendentes:pend,
   atendimentos:{total:tot,psicologico:q(t=>t==='Psicológico'),social:q(t=>t==='Social'),outros:q(t=>t!=='Psicológico'&&t!=='Social'),horas:Math.round(at.reduce((s,x)=>s+(x.m||0),0)/60*100)/100}}}
 const perOk=c=>{const ano=+c.q.get('ano')||+c.body.ano,mes=+c.q.get('mes')||+c.body.mes;if(!(mes>=1&&mes<=12&&ano>=2000&&ano<=2100))throw E(400,'Período inválido.');return[ano,mes]};
-R('GET','/api/faturamentos/previa',['admin'],c=>{const cl=getCl(c.q.get('client_id')),[ano,mes]=perOk(c);return{...faturaCalc(cl,ano,mes),ja_fechado:!!fatDoMes(cl.id,ymOf(ano,mes))}});
+R('GET','/api/faturamentos/previa',GEST,c=>{const cl=getCl(c.q.get('client_id')),[ano,mes]=perOk(c);return{...faturaCalc(cl,ano,mes),ja_fechado:!!fatDoMes(cl.id,ymOf(ano,mes))}});
 /* histórico de fechamentos/reaberturas (quem, quando e por quê) */
 db.exec('CREATE TABLE IF NOT EXISTS faturamento_hist(id INTEGER PRIMARY KEY,client_id INTEGER,ano INTEGER,mes INTEGER,evento TEXT,status_ant TEXT,total REAL,nf TEXT,motivo TEXT,user_id INTEGER,quando TEXT)');
 const fatHist=(u,f,evento,motivo)=>db.prepare('INSERT INTO faturamento_hist(client_id,ano,mes,evento,status_ant,total,nf,motivo,user_id,quando) VALUES(?,?,?,?,?,?,?,?,?,?)').run(f.client_id,f.ano,f.mes,evento,f.status||null,f.total,f.nf||null,motivo||null,u.id,now());
@@ -595,25 +603,25 @@ function fecharCliente(c,cl,ano,mes,obs){
   const rids=f.itens.filter(i=>i.reembolso_id).map(i=>+i.reembolso_id);if(rids.length)db.prepare('UPDATE reembolsos SET fat_id=? WHERE id IN ('+rids.join(',')+')').run(id);
   db.prepare('UPDATE despesas SET fat_id=? WHERE client_id=? AND fat_id IS NULL AND substr(data,1,7)=?').run(id,cl.id,ymOf(ano,mes));fatHist(c.u,{client_id:cl.id,ano,mes,total:f.total},'fechado');db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}
  audit(c.u,'faturamento_fechado',id+':'+cl.id,c.ip);return{id,total:f.total,atendimentos:a.total,pendentes:f.pendentes}}
-R('POST','/api/faturamentos',['admin'],c=>{need(c,'client_id','ano','mes');const[ano,mes]=perOk(c);return fecharCliente(c,getCl(c.body.client_id),ano,mes,c.body.obs)});
+R('POST','/api/faturamentos',GEST,c=>{need(c,'client_id','ano','mes');const[ano,mes]=perOk(c);return fecharCliente(c,getCl(c.body.client_id),ano,mes,c.body.obs)});
 /* Fechar o mês de vários clientes de uma vez: sem client_ids = todos os clientes ativos ainda em aberto. Cada cliente é fechado em sua própria transação. */
-R('POST','/api/faturamentos/lote',['admin'],c=>{const[ano,mes]=perOk(c),ym=ymOf(ano,mes),ids=Array.isArray(c.body.client_ids)?c.body.client_ids.map(Number):null,out={fechados:[],ignorados:[],erros:[],total:0};
+R('POST','/api/faturamentos/lote',GEST,c=>{const[ano,mes]=perOk(c),ym=ymOf(ano,mes),ids=Array.isArray(c.body.client_ids)?c.body.client_ids.map(Number):null,out={fechados:[],ignorados:[],erros:[],total:0};
  for(const cl of db.prepare('SELECT * FROM clients WHERE ativo=1 ORDER BY fantasia').all()){if(ids&&!ids.includes(cl.id))continue;
   if(fatDoMes(cl.id,ym)){out.ignorados.push({cliente:cl.fantasia,motivo:'Já fechado'});continue}
   try{const r=fecharCliente(c,cl,ano,mes,c.body.obs);out.fechados.push({client_id:cl.id,cliente:cl.fantasia,id:r.id,total:r.total,pendentes:r.pendentes});out.total=Math.round((out.total+r.total)*100)/100}
   catch(e){(e.status===400?out.ignorados:out.erros).push({cliente:cl.fantasia,motivo:e.message})}}
  audit(c.u,'faturamento_lote_fechado',ym+':'+out.fechados.length,c.ip);return out});
 /* Situação do mês de TODOS os clientes (Em aberto / Fechado / Faturado / Nada a faturar) para o painel de fechamento mensal */
-R('GET','/api/faturamentos/mes',['admin'],c=>{const[ano,mes]=perOk(c),ym=ymOf(ano,mes);
+R('GET','/api/faturamentos/mes',GEST,c=>{const[ano,mes]=perOk(c),ym=ymOf(ano,mes);
  return db.prepare('SELECT * FROM clients ORDER BY fantasia').all().map(cl=>{const f=fatDoMes(cl.id,ym);if(!f&&!cl.ativo)return null;
   const pend=db.prepare("SELECT COUNT(*) n FROM atend WHERE client_id=? AND substr(data,1,7)=? AND status IN ('Pendente de validação','Em andamento')").get(cl.id,ym).n,
    reab=db.prepare("SELECT COUNT(*) n FROM faturamento_hist WHERE client_id=? AND ano=? AND mes=? AND evento='reaberto'").get(cl.id,ano,mes).n;
   if(f)return{client_id:cl.id,cliente:cl.fantasia,situacao:f.status,faturamento_id:f.id,mensalidade:f.mensalidade,despesas:f.despesas,reembolsos:f.reembolsos||0,total:f.total,atend:f.qtd_atend,psico:f.qtd_psico,social:f.qtd_social,nf:f.nf,faturado_em:f.faturado_em,pendentes:pend,reaberturas:reab};
   const p=faturaCalc(cl,ano,mes);return{client_id:cl.id,cliente:cl.fantasia,situacao:fatVazio(p)?'Nada a faturar':'Em aberto',faturamento_id:null,mensalidade:p.mensalidade,despesas:p.despesas,reembolsos:p.reembolsos,reemb_aguardando:p.reembolsos_aguardando,total:p.total,atend:p.atendimentos.total,psico:p.atendimentos.psicologico,social:p.atendimentos.social,nf:null,pendentes:pend,reaberturas:reab}}).filter(Boolean)});
-R('GET','/api/faturamentos/historico',['admin'],c=>{const cl=getCl(c.q.get('client_id')),[ano,mes]=perOk(c);return db.prepare('SELECT h.*,u.nome usuario FROM faturamento_hist h LEFT JOIN users u ON u.id=h.user_id WHERE h.client_id=? AND h.ano=? AND h.mes=? ORDER BY h.id').all(cl.id,ano,mes)});
+R('GET','/api/faturamentos/historico',GEST,c=>{const cl=getCl(c.q.get('client_id')),[ano,mes]=perOk(c);return db.prepare('SELECT h.*,u.nome usuario FROM faturamento_hist h LEFT JOIN users u ON u.id=h.user_id WHERE h.client_id=? AND h.ano=? AND h.mes=? ORDER BY h.id').all(cl.id,ano,mes)});
 const fatOut=f=>({...f,itens:JSON.parse(f.itens||'[]')});
-R('GET','/api/faturamentos',['admin'],()=>db.prepare('SELECT f.*,c.fantasia FROM faturamentos f JOIN clients c ON c.id=f.client_id ORDER BY f.ano DESC,f.mes DESC,c.fantasia').all().map(fatOut));
-R('POST','/api/faturamentos/:id/faturar',['admin'],c=>{const r=db.prepare("UPDATE faturamentos SET status='Faturado',faturado_em=?,nf=? WHERE id=? AND status='Fechado'").run(now(),String(c.body.nf||'').slice(0,40),c.params.id);if(!r.changes)throw E(409,'Já faturado ou inexistente.');audit(c.u,'faturamento_faturado',c.params.id,c.ip);return{ok:1}});
+R('GET','/api/faturamentos',GEST,()=>db.prepare('SELECT f.*,c.fantasia FROM faturamentos f JOIN clients c ON c.id=f.client_id ORDER BY f.ano DESC,f.mes DESC,c.fantasia').all().map(fatOut));
+R('POST','/api/faturamentos/:id/faturar',GEST,c=>{const r=db.prepare("UPDATE faturamentos SET status='Faturado',faturado_em=?,nf=? WHERE id=? AND status='Fechado'").run(now(),String(c.body.nf||'').slice(0,40),c.params.id);if(!r.changes)throw E(409,'Já faturado ou inexistente.');audit(c.u,'faturamento_faturado',c.params.id,c.ip);return{ok:1}});
 /* Reabrir: desfaz o fechamento do cliente naquele mês (as despesas voltam a ficar em aberto e o mês pode ser fechado de novo).
    Fechamento já FATURADO só é reaberto com confirmação explícita e motivo; fica registrado no histórico e na auditoria. */
 function reabrirFat(c,f,motivo,confirmar){const m=String(motivo||'').trim().slice(0,300);
@@ -621,20 +629,20 @@ function reabrirFat(c,f,motivo,confirmar){const m=String(motivo||'').trim().slic
  db.exec('BEGIN');try{fatHist(c.u,f,'reaberto',m);db.prepare('UPDATE despesas SET fat_id=NULL WHERE fat_id=?').run(f.id);db.prepare('UPDATE reembolsos SET fat_id=NULL WHERE fat_id=?').run(f.id);db.prepare('DELETE FROM faturamentos WHERE id=?').run(f.id);db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}
  audit(c.u,'faturamento_reaberto',f.id+':'+f.client_id+':'+ymOf(f.ano,f.mes)+':'+f.status,c.ip)}
 const getFat=id=>{const f=db.prepare('SELECT * FROM faturamentos WHERE id=?').get(id);if(!f)throw E(404,'Fechamento não encontrado.');return f};
-R('POST','/api/faturamentos/:id/cancelar',['admin'],c=>{const f=getFat(c.params.id);if(f.status!=='Fechado')throw E(423,'Fechamento já faturado: use "Reabrir" e informe o motivo.');reabrirFat(c,f,'',false);return{ok:1}});
-R('POST','/api/faturamentos/:id/reabrir',['admin'],c=>{const f=getFat(c.params.id);reabrirFat(c,f,c.body.motivo,c.body.confirmar);return{ok:1,client_id:f.client_id,ano:f.ano,mes:f.mes}});
+R('POST','/api/faturamentos/:id/cancelar',GEST,c=>{const f=getFat(c.params.id);if(f.status!=='Fechado')throw E(423,'Fechamento já faturado: use "Reabrir" e informe o motivo.');reabrirFat(c,f,'',false);return{ok:1}});
+R('POST','/api/faturamentos/:id/reabrir',GEST,c=>{const f=getFat(c.params.id);reabrirFat(c,f,c.body.motivo,c.body.confirmar);return{ok:1,client_id:f.client_id,ano:f.ano,mes:f.mes}});
 /* Reabrir vários de uma vez: sem client_ids = todos os fechados do mês. Os já faturados só entram com incluir_faturados e motivo. */
-R('POST','/api/faturamentos/reabrir-lote',['admin'],c=>{const[ano,mes]=perOk(c),ids=Array.isArray(c.body.client_ids)?c.body.client_ids.map(Number):null,inc=c.body.incluir_faturados===true,m=String(c.body.motivo||'').trim();
+R('POST','/api/faturamentos/reabrir-lote',GEST,c=>{const[ano,mes]=perOk(c),ids=Array.isArray(c.body.client_ids)?c.body.client_ids.map(Number):null,inc=c.body.incluir_faturados===true,m=String(c.body.motivo||'').trim();
  if(inc&&m.length<5)throw E(400,'Informe o motivo da reabertura (mínimo de 5 caracteres) para reabrir fechamentos já faturados.');const out={reabertos:[],ignorados:[]};
  for(const f of db.prepare('SELECT f.*,cl.fantasia FROM faturamentos f JOIN clients cl ON cl.id=f.client_id WHERE f.ano=? AND f.mes=? ORDER BY cl.fantasia').all(ano,mes)){if(ids&&!ids.includes(f.client_id))continue;
   if(f.status==='Faturado'&&!inc){out.ignorados.push({cliente:f.fantasia,motivo:'Já faturado'+(f.nf?' (NF '+f.nf+')':'')});continue}
   reabrirFat(c,f,m,true);out.reabertos.push({client_id:f.client_id,cliente:f.fantasia})}
  audit(c.u,'faturamento_lote_reaberto',ymOf(ano,mes)+':'+out.reabertos.length,c.ip);return out});
 const fatDados=id=>{const f=db.prepare('SELECT f.*,c.fantasia,c.razao,c.cnpj FROM faturamentos f JOIN clients c ON c.id=f.client_id WHERE f.id=?').get(id);if(!f)throw E(404,'Fechamento não encontrado.');return fatOut(f)};
-R('GET','/api/export/faturamento/:id.xlsx',['admin'],c=>{const f=fatDados(c.params.id),per=String(f.mes).padStart(2,'0')+'/'+f.ano;
+R('GET','/api/export/faturamento/:id.xlsx',GEST,c=>{const f=fatDados(c.params.id),per=String(f.mes).padStart(2,'0')+'/'+f.ano;
  return FX(c,`faturamento-${f.ano}-${String(f.mes).padStart(2,'0')}.xlsx`,[{nome:'Resumo',cols:[{h:'Item',w:34},{h:'Valor',w:30}],rows:[['Cliente',f.fantasia],['Razão social',f.razao],['CNPJ',f.cnpj],['Período',per],['Mensalidade','R$ '+f.mensalidade.toFixed(2)],['Despesas variáveis','R$ '+f.despesas.toFixed(2)],['Total a faturar','R$ '+f.total.toFixed(2)],['Atendimentos realizados no mês',f.qtd_atend],['   Psicológicos',f.qtd_psico],['   Sociais',f.qtd_social],['   Outros',f.qtd_atend-f.qtd_psico-f.qtd_social],['Horas de atendimento',f.horas],['Situação',f.status+(f.nf?' · NF '+f.nf:'')]]},
   {nome:'Itens a faturar',cols:[{h:'Data',t:'d'},{h:'Descrição',w:60},{h:'Quantidade',t:'n'},{h:'Valor unitário',t:'m'},{h:'Valor',t:'m'}],rows:f.itens.map(i=>[i.data,i.descricao,i.qtd,i.unit,i.valor])}])});
-R('GET','/api/export/faturamento/:id.pdf',['admin'],c=>{const f=fatDados(c.params.id),d=new X.Doc(),per=String(f.mes).padStart(2,'0')+'/'+f.ano,NAVY=[0.02,0.18,0.34],GR=[0.32,0.4,0.48];audit(c.u,'exportacao','faturamento-'+f.id+'.pdf',c.ip);
+R('GET','/api/export/faturamento/:id.pdf',GEST,c=>{const f=fatDados(c.params.id),d=new X.Doc(),per=String(f.mes).padStart(2,'0')+'/'+f.ano,NAVY=[0.02,0.18,0.34],GR=[0.32,0.4,0.48];audit(c.u,'exportacao','faturamento-'+f.id+'.pdf',c.ip);
  d.band('Demonstrativo de faturamento',f.fantasia+'   |   '+per);
  {d.need(90);const w=(495-30)/4,y=d.y;[[fmtBRL(f.mensalidade),'Mensalidade',NAVY],[fmtBRL(f.despesas),'Despesas variáveis',NAVY],[fmtBRL(f.total),'Total a faturar',[0.004,0.667,0.635]],[String(f.qtd_atend),'Atendimentos no mês',NAVY]].forEach(([v,l,col],i)=>{const x0=50+i*(w+10);d.rect(x0,y-66,w,66,[0.95,0.97,0.99]);d.rect(x0,y-66,5,66,col);d.text(x0+14,y-32,16,v,true);d.text(x0+14,y-54,10,l,false,GR)});d.y=y-88}
  d.line(f.razao+'  -  CNPJ '+f.cnpj,12,false,50,1.5,GR);d.y-=4;
@@ -678,15 +686,52 @@ function impDep(cl,itens,upd,conf,c){const ks=db.prepare('SELECT * FROM colabora
    else db.prepare('UPDATE dependentes SET parentesco=?,nasc=?,nasc_enc=?,cpf_enc=?,cpf_hash=? WHERE id=?').run(p.par,'',enc(p.nasc),p.cpf?enc(p.cpf):p.f.d.cpf_enc,p.cpf?p.hd:p.f.d.cpf_hash,p.f.d.id)}});audit(c.u,'importacao_dependentes',cl.id+':novos'+novos+':atualizados'+atualizados,c.ip)}
  return{novos,atualizados,ignorados:ign,erros_total:erros.length,erros:erros.slice(0,100),amostra:plano.slice(0,8).map(p=>({acao:p.op==='novo'?'Novo':'Atualizar',nome:p.nome+' ('+p.par+')',cpf:maskCpf(dec(p.k.cpf_enc)),detalhe:'titular: '+dec(p.k.nome_enc)+(p.nasc?' · nasc. '+dtBR(p.nasc):'')}))}}
 const tx=fn=>{db.exec('BEGIN');try{const r=fn();db.exec('COMMIT');return r}catch(e){db.exec('ROLLBACK');throw e}};
-R('POST','/api/importacao',PEOPLE,c=>{need(c,'tipo','client_id','arquivo');const b=c.body,tipo=b.tipo==='dependentes'?'dependentes':'colaboradores',cl=db.prepare('SELECT * FROM clients WHERE id=? AND ativo=1').get(b.client_id);if(!cl)throw E(400,'Selecione a empresa dos colaboradores.');
+R('POST','/api/importacao',PEOPLE_G,c=>{need(c,'tipo','client_id','arquivo');const b=c.body,tipo=b.tipo==='dependentes'?'dependentes':'colaboradores',cl=db.prepare('SELECT * FROM clients WHERE id=? AND ativo=1').get(b.client_id);if(!cl)throw E(400,'Selecione a empresa dos colaboradores.');
  const buf=Buffer.from(String(b.arquivo),'base64');if(!buf.length||buf.length>12e6)throw E(400,'Arquivo vazio ou maior que 12 MB.');
  let P;try{P=IM.analisar(buf,tipo)}catch(e){if(!e.user)console.error(e);throw E(400,e.user?e.message:'Não foi possível ler a planilha. Salve-a como .xlsx ou .csv e tente novamente.')}
  if(!P.itens.length)throw E(400,'A planilha não tem linhas de dados abaixo do cabeçalho.');if(P.itens.length>5000)throw E(400,'Máximo de 5.000 linhas por importação. Divida o arquivo.');
  const conf=b.confirmar===true,upd=b.atualizar===true,r=(tipo==='dependentes'?impDep:impColab)(cl,P.itens,upd,conf,c);
  return{tipo,empresa:cl.fantasia,aba:P.aba,colunas:P.colunas,total:P.itens.length,confirmado:conf,...r}});
 const INSTR=[['1. Preencha uma linha por colaborador (ou por dependente) na primeira aba, sem alterar os títulos das colunas.'],['2. CPF: com ou sem pontos e traço. O sistema confere os dígitos verificadores.'],['3. Data de nascimento: no formato DD/MM/AAAA.'],['4. Na tela de importação escolha a EMPRESA: todos os registros do arquivo entram nessa empresa, sem se misturar com as demais.'],['5. Quem já existe (mesmo CPF na mesma empresa) é ignorado, ou atualizado se você marcar "Atualizar cadastros existentes".'],['6. Dependentes: informe o CPF do colaborador (titular) na mesma empresa. O colaborador precisa já estar cadastrado.'],['7. Salve como .xlsx (ou CSV) e envie. Arquivos .xls antigos precisam ser salvos novamente como .xlsx.']];
-R('GET','/api/export/modelo-colaboradores.xlsx',PEOPLE,c=>FX(c,'modelo-colaboradores.xlsx',[{nome:'Colaboradores',cols:[{h:'Nome',w:34},{h:'CPF',w:18},{h:'Cargo',w:26},{h:'Data de nascimento',w:20}],rows:[]},{nome:'Instruções',cols:[{h:'Como preencher',w:110}],rows:INSTR}]));
-R('GET','/api/export/modelo-dependentes.xlsx',PEOPLE,c=>FX(c,'modelo-dependentes.xlsx',[{nome:'Dependentes',cols:[{h:'CPF do colaborador',w:20},{h:'Nome do dependente',w:34},{h:'Parentesco',w:18},{h:'Data de nascimento',w:20},{h:'CPF do dependente',w:20}],rows:[]},{nome:'Instruções',cols:[{h:'Como preencher',w:110}],rows:INSTR}]));
+R('GET','/api/export/modelo-colaboradores.xlsx',PEOPLE_G,c=>FX(c,'modelo-colaboradores.xlsx',[{nome:'Colaboradores',cols:[{h:'Nome',w:34},{h:'CPF',w:18},{h:'Cargo',w:26},{h:'Data de nascimento',w:20}],rows:[]},{nome:'Instruções',cols:[{h:'Como preencher',w:110}],rows:INSTR}]));
+R('GET','/api/export/modelo-dependentes.xlsx',PEOPLE_G,c=>FX(c,'modelo-dependentes.xlsx',[{nome:'Dependentes',cols:[{h:'CPF do colaborador',w:20},{h:'Nome do dependente',w:34},{h:'Parentesco',w:18},{h:'Data de nascimento',w:20},{h:'CPF do dependente',w:20}],rows:[]},{nome:'Instruções',cols:[{h:'Como preencher',w:110}],rows:INSTR}]));
+/* ---------- FATURAMENTO DO EXCEDENTE (separado do faturamento mensal) ----------
+   Por cliente e mês: atendimentos acima do limite por pessoa (cadastro do cliente) × valor por atendimento excedente.
+   Impostos: usa a mesma configuração do DRE (Lucro Presumido ou Simples Nacional). Com "repassar" (padrão), os impostos são somados ao valor
+   (valor da nota = serviço ÷ (1 − alíquota total)), assim a Acella recebe o valor do serviço líquido de tributos; sem "repassar", os impostos ficam destacados dentro do valor.
+   Sigilo: o fechamento e as exportações NÃO trazem nomes, só "Pessoa 1, 2…" com quantidades. Estimativa: confirme com a contabilidade. */
+db.exec(`CREATE TABLE IF NOT EXISTS fat_excedente(id INTEGER PRIMARY KEY,client_id INTEGER REFERENCES clients(id),ano INTEGER,mes INTEGER,limite INTEGER,pessoas INTEGER,qtd_excedente INTEGER,valor_unit REAL,valor_servico REAL,regime TEXT,aliquota REAL,impostos TEXT,total_impostos REAL,repassar INTEGER DEFAULT 1,total REAL,itens TEXT,status TEXT DEFAULT 'Fechado',nf TEXT,faturado_em TEXT,obs TEXT,criado TEXT,criado_por INTEGER,UNIQUE(client_id,ano,mes))`);
+function impostosExc(base,ano,mes,repassar){const imp=getImp(),sim=imp.regime==='simples';let tx=imp.simples;
+ if(sim&&imp.simples_prog){const t=simplesTaxas(imp)[ano*100+mes];if(t!=null)tx=t}
+ const comp=sim?[['DAS (Simples Nacional)',tx]]:[['PIS',imp.pis],['COFINS',imp.cofins],['ISS',imp.iss],['IRPJ ('+imp.irpj+'% sobre '+imp.presuncao+'% da receita)',imp.presuncao*imp.irpj/100],['CSLL ('+imp.csll+'% sobre '+imp.presuncao+'% da receita)',imp.presuncao*imp.csll/100]];
+ const aliq=Math.round(comp.reduce((s,x)=>s+(+x[1]||0),0)*10000)/10000;if(aliq>=60)throw E(400,'Alíquota total de impostos inválida (≥ 60%). Revise em DRE → Impostos.');
+ const total=R2(repassar?base/(1-aliq/100):base),itens=comp.map(([n,a])=>({imposto:n,aliquota:Math.round(a*10000)/10000,valor:R2(total*a/100)}));
+ return{regime:sim?'Simples Nacional':'Lucro Presumido',aliquota:aliq,impostos:itens,total_impostos:R2(itens.reduce((s,x)=>s+x.valor,0)),total}}
+function excCalc(cl,ano,mes,repassar){const ym=ymOf(ano,mes),pes=atendPessoas(ym,cl.id,false).filter(p=>p.excedente>0),qtd=pes.reduce((s,p)=>s+p.excedente,0),unit=R2(cl.valor_excedente||0),serv=R2(qtd*unit),t=impostosExc(serv,ano,mes,repassar);
+ return{client_id:cl.id,cliente:cl.fantasia,razao:cl.razao,cnpj:cl.cnpj,ano,mes,limite:cl.limite_atend_mes||0,pessoas:pes.length,qtd_excedente:qtd,valor_unit:unit,valor_servico:serv,repassar:!!repassar,...t,
+  itens:pes.map((p,i)=>({pessoa:'Pessoa '+(i+1),qtd:p.qtd,limite:p.limite,excedente:p.excedente,valor:R2(p.excedente*unit),ref:(p.dep_id?'d':'c')+(p.dep_id||p.colab_id||0)}))}}
+const excDoMes=(cid,ano,mes)=>db.prepare('SELECT * FROM fat_excedente WHERE client_id=? AND ano=? AND mes=?').get(cid,ano,mes);
+const excOut=f=>({...f,impostos:JSON.parse(f.impostos||'[]'),itens:JSON.parse(f.itens||'[]').map(({ref,...x})=>x),repassar:!!f.repassar});
+const simNao=v=>!(v===false||v===0||v==='0'||v==='false');
+/* situação do mês de todos os clientes com limite cadastrado (ou com fechamento de excedente no mês) */
+R('GET','/api/fat-excedente',GEST,c=>{const[ano,mes]=perOk(c);
+ return db.prepare('SELECT * FROM clients ORDER BY fantasia').all().map(cl=>{const f=excDoMes(cl.id,ano,mes);if(f)return{...excOut(f),cliente:cl.fantasia,situacao:f.status};
+  if(!cl.ativo||!cl.limite_atend_mes)return null;const p=excCalc(cl,ano,mes,true);return{...p,id:null,situacao:p.qtd_excedente?(p.valor_unit?'Em aberto':'Sem valor cadastrado'):'Sem excedente'}}).filter(Boolean)});
+R('GET','/api/fat-excedente/previa',GEST,c=>{const cl=getCl(c.q.get('client_id')),[ano,mes]=perOk(c);return{...excCalc(cl,ano,mes,simNao(c.q.get('repassar')??'1')),ja_fechado:!!excDoMes(cl.id,ano,mes)}});
+R('POST','/api/fat-excedente',GEST,c=>{need(c,'client_id','ano','mes');const[ano,mes]=perOk(c),cl=getCl(c.body.client_id);if(excDoMes(cl.id,ano,mes))throw E(409,'O excedente deste mês já foi fechado para este cliente.');
+ if(!cl.limite_atend_mes)throw E(400,'Cadastre o limite de atendimentos por pessoa no cliente.');const f=excCalc(cl,ano,mes,simNao(c.body.repassar??true));
+ if(!f.qtd_excedente)throw E(400,'Não há atendimentos acima do limite neste mês.');if(!f.valor_unit)throw E(400,'Cadastre o valor por atendimento excedente no cliente.');
+ const r=db.prepare('INSERT INTO fat_excedente(client_id,ano,mes,limite,pessoas,qtd_excedente,valor_unit,valor_servico,regime,aliquota,impostos,total_impostos,repassar,total,itens,obs,criado,criado_por) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(cl.id,ano,mes,f.limite,f.pessoas,f.qtd_excedente,f.valor_unit,f.valor_servico,f.regime,f.aliquota,JSON.stringify(f.impostos),f.total_impostos,f.repassar?1:0,f.total,JSON.stringify(f.itens),String(c.body.obs||'').slice(0,500),now(),c.u.id);
+ audit(c.u,'excedente_fechado',r.lastInsertRowid+':'+cl.id+':'+ymOf(ano,mes)+':'+f.total,c.ip);return{id:Number(r.lastInsertRowid),total:f.total}});
+const getExc=id=>{const f=db.prepare('SELECT * FROM fat_excedente WHERE id=?').get(id);if(!f)throw E(404,'Fechamento de excedente não encontrado.');return f};
+R('POST','/api/fat-excedente/:id/faturar',GEST,c=>{const r=db.prepare("UPDATE fat_excedente SET status='Faturado',faturado_em=?,nf=? WHERE id=? AND status='Fechado'").run(now(),String(c.body.nf||'').slice(0,40),c.params.id);if(!r.changes)throw E(409,'Já faturado ou inexistente.');audit(c.u,'excedente_faturado',c.params.id,c.ip);return{ok:1}});
+R('POST','/api/fat-excedente/:id/reabrir',GEST,c=>{const f=getExc(c.params.id),m=String(c.body.motivo||'').trim().slice(0,300);
+ if(f.status==='Faturado'&&m.length<5)throw E(400,'Este excedente já foi faturado'+(f.nf?' (NF '+f.nf+')':'')+': informe o motivo da reabertura (mínimo de 5 caracteres).');
+ db.prepare('DELETE FROM fat_excedente WHERE id=?').run(f.id);audit(c.u,'excedente_reaberto',f.id+':'+f.client_id+':'+ymOf(f.ano,f.mes)+':'+f.status+(m?':'+m:''),c.ip);return{ok:1}});
+R('GET','/api/export/fat-excedente/:id.xlsx',GEST,c=>{const f0=getExc(c.params.id),cl=getCl(f0.client_id),f=excOut(f0),per=String(f.mes).padStart(2,'0')+'/'+f.ano;audit(c.u,'exportacao','fat-excedente-'+f.id+'.xlsx',c.ip);
+ return FX(c,`excedente-${f.ano}-${String(f.mes).padStart(2,'0')}-${String(cl.fantasia||'cliente').replace(/[^\w-]+/g,'_')}.xlsx`,[{nome:'Resumo',cols:[{h:'Item',w:44},{h:'Valor',w:30}],rows:[['Cliente',cl.fantasia],['Razão social',cl.razao],['CNPJ',cl.cnpj],['Período',per],['Limite de atendimentos por pessoa no mês',f.limite],['Pessoas acima do limite',f.pessoas],['Atendimentos excedentes',f.qtd_excedente],['Valor por atendimento excedente','R$ '+f.valor_unit.toFixed(2)],['Valor do serviço','R$ '+f.valor_servico.toFixed(2)],['Regime de impostos',f.regime+' (alíquota total '+String(f.aliquota).replace('.',',')+'%)'],['Impostos '+(f.repassar?'acrescidos ao valor':'destacados no valor'),'R$ '+f.total_impostos.toFixed(2)],['Total a faturar','R$ '+f.total.toFixed(2)],['Situação',f.status+(f.nf?' · NF '+f.nf:'')]]},
+  {nome:'Impostos',cols:[{h:'Imposto',w:44},{h:'Alíquota (%)',t:'n'},{h:'Valor',t:'m'}],rows:f.impostos.map(i=>[i.imposto,i.aliquota,i.valor])},
+  {nome:'Excedente por pessoa',cols:[{h:'Pessoa (sem identificação, por sigilo)',w:36},{h:'Atendimentos no mês',t:'n'},{h:'Limite',t:'n'},{h:'Excedente',t:'n'},{h:'Valor',t:'m'}],rows:f.itens.map(i=>[i.pessoa,i.qtd,i.limite,i.excedente,i.valor])}])});
 /* ---------- servidor ---------- */
 /* ---------- PLANO DE NEGÓCIOS (v9): premissas, custos da estrutura e evolução por fases ----------
    O plano é uma hipótese; a "evolução" compara mês a mês o PLANO (calculado pelas premissas) com o que o SISTEMA registrou
@@ -845,7 +890,7 @@ const PLAN={
   if(f.modelo)bq.push('Formulários-modelo do sistema não podem ser excluídos (duplique para criar o seu).');if(nc)bq.push(nc+' campanha(s) usam este formulário. Exclua-as antes.');
   return{rotulo:'formulário',nome:f.nome,audit:'form',bloq:bq,apaga:[],aviso:'',run:()=>db.prepare('DELETE FROM forms WHERE id=?').run(id)}}
 };
-const ROLE_NOME={admin:'Administrador',psicologo:'Psicólogo(a)',assistente_social:'Assistente social',cliente:'Cliente',outro:'Outro'};
+const ROLE_NOME={admin:'Administrador',adm_assist:'Assistente administrativo(a)',psicologo:'Psicólogo(a)',assistente_social:'Assistente social',cliente:'Cliente',outro:'Outro'};
 const planExc=c=>{const f=PLAN[c.params.ent];if(!f)throw E(404,'Tipo de registro desconhecido.');const p=f(+c.params.id,c);if(!p)throw E(404,'Registro não encontrado (talvez já tenha sido excluído).');return p};
 R('GET','/api/excluir/:ent/:id',['admin'],c=>{const p=planExc(c);return{rotulo:p.rotulo,nome:p.nome,bloqueios:p.bloq,apagara:p.apaga,efeitos:p.efeitos||[],aviso:p.aviso||''}});
 R('POST','/api/excluir/:ent/:id',['admin'],c=>{const p=planExc(c);if(p.bloq.length)throw E(409,p.bloq.join(' '));if(c.body.confirma!=='EXCLUIR')throw E(400,'Digite EXCLUIR para confirmar.');
