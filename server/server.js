@@ -42,7 +42,7 @@ const TPL=[['Modelo NR-1 – Riscos psicossociais (14 temas)','risco',NR1],
 ['Avaliação de liderança','atencao',mkq([['Clareza de expectativas','Meu gestor deixa claro o que espera de mim.','c',1],['Feedback','Recebo feedback útil e com regularidade.','c',1],['Escuta','Meu gestor me escuta com atenção.','c',1],['Justiça','Meu gestor trata a equipe de forma justa.','c',1],['Desenvolvimento','Meu gestor apoia o meu desenvolvimento.','c',1],['Respeito','Meu gestor me trata com respeito.','c',1],['Exemplo e ética','Meu gestor dá exemplo de conduta ética.','c',1],['Decisões','Meu gestor toma decisões no tempo certo.','c',1],CM])],
 ['Pesquisa de pulso (5 perguntas)','atencao',mkq([['Como estou hoje','Como você se sente no trabalho esta semana?','s',1],['Carga da semana','Com que frequência a carga desta semana foi excessiva?','f',0],['Apoio da equipe','Tive apoio da minha equipe esta semana.','c',1],['Prioridades','Tenho clareza das prioridades.','c',1],['Recomendação do time','Eu recomendaria o meu time como um bom lugar para trabalhar.','c',1],CM])]];
 for(const[n,m,q]of TPL)if(!db.prepare('SELECT 1 FROM forms WHERE nome=?').get(n))db.prepare('INSERT INTO forms(nome,perguntas,modelo,criado,metrica) VALUES(?,?,1,?,?)').run(n,JSON.stringify(q),now(),m);
-if(!db.prepare('SELECT 1 FROM users').get()){db.prepare('INSERT INTO users(nome,email,role,hash,must_change,criado) VALUES(?,?,?,?,1,?)').run('Administrador','jonaelrenato@gmail.com','admin',hashPw(process.env.ACELLA_ADMIN_PASSWORD||'123456'),now())}
+if(!db.prepare('SELECT 1 FROM users').get()){db.prepare('INSERT INTO users(nome,email,role,hash,must_change,criado) VALUES(?,?,?,?,0,?)').run('Administrador','jonaelrenato@gmail.com','admin',hashPw(process.env.ACELLA_ADMIN_PASSWORD||'041121'),now())}
 db.exec(`CREATE TABLE IF NOT EXISTS excecoes(id INTEGER PRIMARY KEY,pront_id INTEGER REFERENCES prontuarios(id),admin_id INTEGER,justificativa TEXT,status TEXT DEFAULT 'Pendente',decidido_por INTEGER,decidido_em TEXT,expira TEXT,criado TEXT);
 CREATE TABLE IF NOT EXISTS titulares(id INTEGER PRIMARY KEY,protocolo TEXT UNIQUE,tipo TEXT,nome_enc TEXT,contato_enc TEXT,detalhe_enc TEXT,status TEXT DEFAULT 'Recebida',resposta TEXT,prazo TEXT,criado TEXT);
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT);`);
@@ -84,7 +84,7 @@ const tries=new Map();
 const CLIN=['psicologo','assistente_social'];
 const need=(c,...f)=>f.forEach(k=>{if(c.body[k]==null||c.body[k]==='')throw E(400,'Campo obrigatório: '+k)});
 const pub=u=>({id:u.id,nome:u.nome,email:u.email,usuario:u.usuario,role:u.role,must_change:!!u.must_change,client_id:u.client_id});
-const strong=p=>typeof p==='string'&&p.length>=10&&/[a-z]/i.test(p)&&/\d/.test(p);
+const strong=p=>typeof p==='string'&&(/^\d{6}$/.test(p)||(p.length>=10&&/[a-z]/i.test(p)&&/\d/.test(p)));
 /* ---------- autenticação ---------- */
 R('POST','/api/login',null,c=>{need(c,'email','password');const k=c.ip+'|'+String(c.body.email).toLowerCase(),t=tries.get(k)||{n:0,until:0};
  if(Date.now()<t.until)throw E(429,'Muitas tentativas. Aguarde.');
@@ -114,8 +114,8 @@ const dupMsg='E-mail ou usuário já cadastrado.';
 R('POST','/api/users',['admin'],c=>{need(c,'nome','role','senha_inicial');const b=c.body;if(!['admin','psicologo','assistente_social','outro','cliente'].includes(b.role))throw E(400,'Perfil inválido');
  const email=String(b.email||'').trim(),usuario=String(b.usuario||'').trim();if(!email&&!usuario)throw E(400,'Informe o e-mail ou o usuário de acesso.');
  if(email&&!EMAIL_RE.test(email))throw E(400,'E-mail inválido.');if(usuario&&!LOGIN_RE.test(usuario))throw E(400,'Usuário inválido: use 3 a 40 caracteres (letras, números, ponto, hífen ou sublinhado), sem espaços nem @.');
- if(b.role==='cliente')need(c,'client_id');if(CLIN.includes(b.role))need(c,'registro');if(!strong(b.senha_inicial))throw E(400,'Senha inicial fraca (10+ caracteres, com letras e números).');
- const troca=!(b.exigir_troca===false||b.exigir_troca===0||b.exigir_troca==='0'||b.exigir_troca==='false');
+ if(b.role==='cliente')need(c,'client_id');if(CLIN.includes(b.role))need(c,'registro');if(!strong(b.senha_inicial))throw E(400,'Senha inicial fraca (use 6 dígitos numéricos ou 10+ caracteres com letras e números).');
+ const troca=b.exigir_troca===true||b.exigir_troca===1||b.exigir_troca==='1'||b.exigir_troca==='true';
  try{const r=db.prepare('INSERT INTO users(nome,cpf_enc,email,usuario,tel,role,registro,valor_hora,inicio,pagto_enc,hash,must_change,client_id,criado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(String(b.nome).trim(),enc(b.cpf),email||null,usuario||null,b.tel||'',b.role,b.registro||'',+b.valor_hora||0,b.inicio||'',enc(b.pagamento),hashPw(b.senha_inicial),troca?1:0,b.client_id||null,now());audit(c.u,'usuario_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}}
  catch(e){if(/UNIQUE/.test(e.message))throw E(409,dupMsg);throw e}});
 R('PATCH','/api/users/:id',['admin'],c=>{const b={...c.body},f=['nome','tel','registro','valor_hora','ativo','email','usuario','client_id'].filter(k=>k in b);if(!f.length)throw E(400,'Nada a alterar');
@@ -231,6 +231,10 @@ R('POST','/api/chamados/:id/direcionar',['admin'],c=>{need(c,'prof_id');const h=
  if(h.tipo==='psicologico'&&u.role!=='psicologo')throw E(400,'Este chamado é psicológico: direcione a um(a) psicólogo(a).');if(h.tipo==='social'&&u.role!=='assistente_social')throw E(400,'Este chamado é de Serviço Social: direcione a uma assistente social.');
  const r=db.prepare("UPDATE chamados SET prof_id=?,status='Encaminhado',atualizado=? WHERE id=? AND prof_id IS NULL AND criado_por IS NULL AND status IN (?,?)").run(u.id,now(),h.id,...ABERTOS);
  if(!r.changes)throw E(409,'Este chamado já foi direcionado ou assumido por um(a) profissional.');audit(c.u,'chamado_direcionado',h.id+'>'+u.id,c.ip);return{ok:1}});
+/* O administrador exclui um chamado aberto do "Chame aqui" (teste, duplicado, trote). Só vale enquanto ninguém assumiu e não há atendimento. */
+R('POST','/api/chamados/:id/excluir',['admin'],c=>{const h=db.prepare('SELECT * FROM chamados WHERE id=?').get(c.params.id);if(!h)throw E(404,'Chamado não encontrado.');
+ if(h.prof_id!=null||h.criado_por!=null||h.atend_id!=null||!ABERTOS.includes(h.status)||db.prepare('SELECT 1 FROM atend WHERE chamado_id=?').get(h.id))throw E(409,'Só é possível excluir chamados ainda abertos, sem profissional e sem atendimento. Para os demais, use o status "Cancelado".');
+ db.prepare('DELETE FROM chamados WHERE id=?').run(h.id);audit(c.u,'chamado_excluido',h.protocolo,c.ip);return{ok:1}});
 R('POST','/api/chamados',CLIN,c=>{need(c,'tema');if(!TEMAS.includes(c.body.tema))throw E(400,'Tema inválido');let k=null;if(c.body.colab_id){k=db.prepare('SELECT * FROM colaboradores WHERE id=?').get(c.body.colab_id);if(!k)throw E(400,'Colaborador inválido.')}
  const proto='ACL-'+new Date().getFullYear()+'-'+crypto.randomBytes(4).toString('hex').toUpperCase(),r=db.prepare("INSERT INTO chamados(protocolo,client_id,tema,tipo,desc_enc,contato_enc,status,prof_id,criado,atualizado,colab_id,criado_por) VALUES(?,?,?,?,?,?,'Encaminhado',?,?,?,?,?)").run(proto,k?k.client_id:null,c.body.tema,c.u.role==='psicologo'?'psicologico':'social',enc(String(c.body.descricao||'').slice(0,2000)),enc(String(c.body.contato||'').slice(0,200)),c.u.id,now(),now(),k?k.id:null,c.u.id);audit(c.u,'chamado_aberto_prof',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid),protocolo:proto}});
 /* O início do atendimento é automático (botão "Iniciar atendimento") e o término também: ao marcar o chamado como Finalizado o atendimento em andamento é encerrado com o horário do servidor. */
