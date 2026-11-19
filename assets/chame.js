@@ -47,5 +47,8 @@ ${cat.map(g=>`<h3>${esc(g.grupo)}${DICA[g.tipo]?`<small>${esc(DICA[g.tipo])}</sm
   try{const r=await fetch('/api/public/chamados',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}),j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.erro||'Não foi possível enviar agora. Tente novamente.');
    d.innerHTML=`<div class="ok"><h2>Recebemos o seu pedido</h2><p>Seu protocolo é <b style="font-size:1.2rem">${esc(j.protocolo)}</b>.<br>Guarde este número. Nossa equipe fará a triagem e entrará em contato${o.contato?'':' (como você não deixou contato, informe o protocolo ao RH ou à Acella para acompanharmos)'}.</p><button class="go" onclick="this.closest('dialog').close()">Fechar</button></div>`}
   catch(x){form(cat,x instanceof TypeError?semServidor():x.message,o)}}}
-b.onclick=async()=>{form(await catalogo());d.showModal()};
+/* No site estático (acella.com.br, GitHub Pages) não há servidor: o botão leva à mesma página no portal, que abre o formulário. */
+const ESTATICO=/^(www\.)?acella\.com\.br$/.test(location.hostname);
+b.onclick=async()=>{if(ESTATICO){location.href='https://portal.acella.com.br'+location.pathname+'#chame';return}form(await catalogo());d.showModal()};
+if(!ESTATICO&&location.hash==='#chame'){history.replaceState(null,'',location.pathname+location.search);b.onclick()}
 })();
