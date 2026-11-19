@@ -1,0 +1,20 @@
+# Acella no Render (Blueprint). Veja NUVEM.md
+# No Render: New + → Blueprint → escolha este repositório.
+# Ele pedirá só ACELLA_KEY e ACELLA_ADMIN_PASSWORD; o resto já vem configurado.
+services:
+  - type: web
+    name: acella
+    runtime: docker
+    plan: starter          # plano pago: necessário para ter disco que guarda os dados
+    region: ohio
+    healthCheckPath: /api/public/temas
+    numInstances: 1        # sempre UMA cópia (o banco é um arquivo SQLite)
+    envVars:
+      - key: ACELLA_KEY             # 64 caracteres hex. Guarde em cofre de senhas!
+        sync: false
+      - key: ACELLA_ADMIN_PASSWORD  # senha provisória do administrador (troca exigida no 1º login)
+        sync: false
+    disk:
+      name: acella-data
+      mountPath: /data
+      sizeGB: 1
