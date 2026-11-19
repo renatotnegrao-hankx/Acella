@@ -77,10 +77,11 @@ if(!db.prepare("SELECT 1 FROM settings WHERE k='dre_bf1'").get()){
  db.prepare("INSERT OR REPLACE INTO settings(k,v) VALUES('dre_bf1',?)").run(now())}
 for(const d of db.prepare("SELECT id,nasc FROM dependentes WHERE nasc IS NOT NULL AND nasc<>'' AND (nasc_enc IS NULL OR nasc_enc='')").all())db.prepare("UPDATE dependentes SET nasc_enc=?,nasc='' WHERE id=?").run(enc(d.nasc),d.id);
 /* ---------- v10: limite de atendimentos por pessoa no mês (contrato do cliente) e valor do excedente ---------- */
-for(const a of['ALTER TABLE clients ADD COLUMN limite_atend_mes INTEGER DEFAULT 0','ALTER TABLE clients ADD COLUMN valor_excedente REAL DEFAULT 0'])try{db.exec(a)}catch(e){}
+for(const a of['ALTER TABLE clients ADD COLUMN limite_atend_mes INTEGER DEFAULT 0','ALTER TABLE clients ADD COLUMN valor_excedente REAL DEFAULT 0','ALTER TABLE clients ADD COLUMN usar_tabela INTEGER DEFAULT 1'])try{db.exec(a)}catch(e){}
 /* ---------- infra ---------- */
 const audit=(u,acao,alvo,ip,ok=1)=>db.prepare('INSERT INTO audit(ts,user_id,acao,alvo,ip,ok) VALUES(?,?,?,?,?,?)').run(now(),u?u.id:null,acao,String(alvo??''),ip,ok);
 const E=(s,m)=>Object.assign(new Error(m),{status:s});
+const simNao=v=>!(v===false||v===0||v==='0'||v==='false');
 const routes=[];const R=(m,p,roles,h)=>routes.push({m,re:new RegExp('^'+p.replace(/:(\w+)/g,'(?<$1>[^/]+)')+'$'),roles,h});
 const tries=new Map();
 const CLIN=['psicologo','assistente_social'];
@@ -101,13 +102,13 @@ R('GET','/api/me','any',c=>pub(c.u));
 R('POST','/api/password','any',c=>{need(c,'atual','nova');if(!chkPw(c.body.atual,c.u.hash))throw E(403,'Senha atual incorreta.');if(!strong(c.body.nova))throw E(400,'A nova senha deve ter 10+ caracteres, com letras e números.');
  db.prepare('UPDATE users SET hash=?,must_change=0 WHERE id=?').run(hashPw(c.body.nova),c.u.id);db.prepare('DELETE FROM sessions WHERE user_id=? AND tok<>?').run(c.u.id,c.tokHash);audit(c.u,'senha_alterada','',c.ip);return{ok:1}});
 /* ---------- clientes (admin) ---------- */
-R('GET','/api/clients',GEST,()=>db.prepare('SELECT * FROM clients ORDER BY fantasia').all());
+R('GET','/api/clients',GEST,()=>db.prepare('SELECT * FROM clients ORDER BY fantasia').all().map(k=>({...k,mens_calc:mensCliente(k)})));
 const num=(v,max=1e7,dec=2)=>{const n=+String(v??0).replace(',','.');if(!Number.isFinite(n)||n<0||n>max)throw E(400,'Valor numérico inválido.');const f=10**dec;return Math.round(n*f)/f};
 const PLANOS_OK=['Essencial','Equilíbrio','Completo'];
 R('POST','/api/clients',GEST,c=>{need(c,'cnpj','razao');const b=c.body;
- try{const r=db.prepare('INSERT INTO clients(cnpj,razao,fantasia,endereco,responsavel,contato,mensalidade,valor_km,plano,funcionarios,preco_func,inicio_contrato,limite_atend_mes,valor_excedente,criado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(b.cnpj,b.razao,b.fantasia||b.razao,b.endereco||'',b.responsavel||'',b.contato||'',num(b.mensalidade),num(b.valor_km,1e4,4),PLANOS_OK.includes(b.plano)?b.plano:null,Math.round(num(b.funcionarios,1e5,0)),num(b.preco_func,1e4,2),/^\d{4}-\d{2}(-\d{2})?$/.test(b.inicio_contrato||'')?String(b.inicio_contrato).slice(0,7):null,Math.round(num(b.limite_atend_mes,1000,0)),num(b.valor_excedente,1e5,2),now());audit(c.u,'cliente_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}}
+ try{const r=db.prepare('INSERT INTO clients(cnpj,razao,fantasia,endereco,responsavel,contato,mensalidade,valor_km,plano,funcionarios,preco_func,inicio_contrato,limite_atend_mes,valor_excedente,usar_tabela,criado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(b.cnpj,b.razao,b.fantasia||b.razao,b.endereco||'',b.responsavel||'',b.contato||'',num(b.mensalidade),num(b.valor_km,1e4,4),PLANOS_OK.includes(b.plano)?b.plano:null,Math.round(num(b.funcionarios,1e5,0)),num(b.preco_func,1e4,2),/^\d{4}-\d{2}(-\d{2})?$/.test(b.inicio_contrato||'')?String(b.inicio_contrato).slice(0,7):null,Math.round(num(b.limite_atend_mes,1000,0)),num(b.valor_excedente,1e5,2),simNao(b.usar_tabela??1)?1:0,now());audit(c.u,'cliente_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}}
  catch(e){if(/UNIQUE/.test(e.message))throw E(409,'Já existe um cliente com este CNPJ.');throw e}});
-R('PATCH','/api/clients/:id',GEST,c=>{const b={...c.body},f=['razao','fantasia','endereco','responsavel','contato','ativo','mensalidade','valor_km','plano','funcionarios','preco_func','inicio_contrato','limite_atend_mes','valor_excedente'].filter(k=>k in b);if(!f.length)throw E(400,'Nada a alterar');
+R('PATCH','/api/clients/:id',GEST,c=>{const b={...c.body},f=['razao','fantasia','endereco','responsavel','contato','ativo','mensalidade','valor_km','plano','funcionarios','preco_func','inicio_contrato','limite_atend_mes','valor_excedente','usar_tabela'].filter(k=>k in b);if('usar_tabela' in b)b.usar_tabela=simNao(b.usar_tabela)?1:0;if(!f.length)throw E(400,'Nada a alterar');
  if('limite_atend_mes' in b)b.limite_atend_mes=Math.round(num(b.limite_atend_mes,1000,0));if('valor_excedente' in b)b.valor_excedente=num(b.valor_excedente,1e5,2);
  if('plano' in b&&!PLANOS_OK.includes(b.plano))b.plano=null;if('funcionarios' in b)b.funcionarios=Math.round(num(b.funcionarios,1e5,0));if('preco_func' in b)b.preco_func=num(b.preco_func,1e4,2);if('inicio_contrato' in b)b.inicio_contrato=/^\d{4}-\d{2}/.test(b.inicio_contrato||'')?String(b.inicio_contrato).slice(0,7):null;
  if('mensalidade' in b)b.mensalidade=num(b.mensalidade);if('valor_km' in b)b.valor_km=num(b.valor_km,1e4,4);
@@ -573,6 +574,22 @@ R('POST','/api/reembolsos/:id/rejeitar',GEST,c=>{const r=getReemb(c.params.id);i
  const m=String(c.body.motivo||'').trim();if(m.length<5)throw E(400,'Informe o motivo da rejeição (mínimo de 5 caracteres): quem lançou verá a justificativa.');reembDecide(c,r,'Rejeitado',m.slice(0,300));return{ok:1}});
 R('POST','/api/reembolsos/:id/desfazer',GEST,c=>{const r=getReemb(c.params.id);if(r.status!=='Aprovado')throw E(409,'Só reembolsos aprovados podem ter a aprovação desfeita.');if(r.fech_id)throw E(423,'Este reembolso já está em um fechamento de profissional.');
  db.prepare("UPDATE reembolsos SET status='Pendente',motivo=NULL,decidido_por=NULL,decidido_em=NULL WHERE id=?").run(r.id);audit(c.u,'reembolso_aprovacao_desfeita',r.id,c.ip);return{ok:1}});
+/* ---------- TABELA DE PREÇOS ----------
+   Mensalidade do cliente pela faixa de colaboradores ATIVOS cadastrados (0 a 100 = R$ 890,90; 101 a 150 = R$ 1.290,90) e
+   atendimento extra (acima do limite por pessoa) = R$ 9,90, pago pelo colaborador. Editável pelo administrador.
+   Cliente com "usar_tabela" desligado, ou acima da última faixa, usa a mensalidade informada no cadastro. */
+const TAB_PAD={faixas:[{ate:100,valor:890.9},{ate:150,valor:1290.9}],extra:9.9};
+const getTab=()=>{let o={};try{o=JSON.parse((db.prepare("SELECT v FROM settings WHERE k='tabela_precos'").get()||{v:'{}'}).v)}catch(e){}return{...TAB_PAD,...o}};
+const nColabs=cid=>db.prepare('SELECT COUNT(*) n FROM colaboradores WHERE client_id=? AND ativo=1').get(cid).n;
+function mensCliente(cl){const n=nColabs(cl.id),T=getTab();
+ if(cl.usar_tabela===0)return{valor:R2(cl.mensalidade||0),origem:'manual',colaboradores:n,descricao:'valor do contrato'};
+ let de=0;for(const f of T.faixas){if(n<=f.ate)return{valor:R2(f.valor),origem:'tabela',colaboradores:n,descricao:'tabela: '+de+' a '+f.ate+' colaboradores ('+n+' ativos)'};de=f.ate+1}
+ return{valor:R2(cl.mensalidade||0),origem:'acima',colaboradores:n,descricao:n+' colaboradores: acima da tabela, valor do contrato'}}
+R('GET','/api/tabela-precos',GEST,()=>getTab());
+R('PUT','/api/tabela-precos',['admin'],c=>{const b=c.body,fx=(Array.isArray(b.faixas)?b.faixas:[]).filter(f=>f&&f.ate!==''&&f.ate!=null&&f.valor!==''&&f.valor!=null).map(f=>({ate:Math.round(num(f.ate,1e6,0)),valor:num(f.valor,1e6,2)}));
+ if(!fx.length)throw E(400,'Informe ao menos uma faixa.');for(let i=0;i<fx.length;i++){if(!(fx[i].valor>0))throw E(400,'Informe o valor de cada faixa.');if(i&&fx[i].ate<=fx[i-1].ate)throw E(400,'As faixas devem estar em ordem crescente de colaboradores.')}
+ const extra=num(b.extra,1e4,2);if(!(extra>0))throw E(400,'Informe o valor do atendimento extra.');const o={faixas:fx,extra};
+ db.prepare("INSERT INTO settings VALUES('tabela_precos',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(JSON.stringify(o));audit(c.u,'tabela_precos',JSON.stringify(o),c.ip);return o});
 /* Cálculo do fechamento do cliente: mensalidade + despesas em aberto do mês + quantidade de atendimentos validados */
 function faturaCalc(cl,ano,mes){const ym=ymOf(ano,mes),
  desp=db.prepare('SELECT * FROM despesas WHERE client_id=? AND fat_id IS NULL AND substr(data,1,7)=? ORDER BY data,id').all(cl.id,ym),
@@ -581,12 +598,12 @@ function faturaCalc(cl,ano,mes){const ym=ymOf(ano,mes),
  rb=db.prepare("SELECT r.* FROM reembolsos r JOIN fechamentos f ON f.id=r.fech_id WHERE r.client_id=? AND r.status='Aprovado' AND r.fat_id IS NULL AND f.ano*100+f.mes<=? ORDER BY r.data,r.id").all(cl.id,ano*100+mes),
  ag=db.prepare("SELECT COALESCE(SUM(status='Pendente'),0) pend,COALESCE(SUM(status='Aprovado'),0) apr,COALESCE(SUM(valor),0) v FROM reembolsos WHERE client_id=? AND status IN ('Pendente','Aprovado') AND fech_id IS NULL AND substr(data,1,7)<=?").get(cl.id,ym),
  pend=db.prepare("SELECT COUNT(*) n FROM atend WHERE client_id=? AND substr(data,1,7)=? AND status IN ('Pendente de validação','Em andamento')").get(cl.id,ym).n,
- mens=Math.round((cl.mensalidade||0)*100)/100,rbv=R2(rb.reduce((s,r)=>s+r.valor,0)),dsp=R2(desp.reduce((s,d)=>s+d.valor,0)+rbv),custo=R2(at.reduce((s,x)=>s+(x.v||0),0)),
- itens=[{tipo:'mensalidade',data:'',descricao:'Mensalidade – '+String(mes).padStart(2,'0')+'/'+ano,qtd:1,unit:mens,valor:mens},
+ MC=mensCliente(cl),mens=MC.valor,rbv=R2(rb.reduce((s,r)=>s+r.valor,0)),dsp=R2(desp.reduce((s,d)=>s+d.valor,0)+rbv),custo=R2(at.reduce((s,x)=>s+(x.v||0),0)),
+ itens=[{tipo:'mensalidade',data:'',descricao:'Mensalidade – '+String(mes).padStart(2,'0')+'/'+ano+' ('+MC.descricao+')',qtd:1,unit:mens,valor:mens},
   ...[...desp.map(d=>({tipo:d.tipo,data:d.data,descricao:d.descricao,qtd:d.km||1,unit:d.km?d.valor_km:d.valor,valor:d.valor,despesa_id:d.id})),
    ...rb.map(r=>({tipo:'km',data:r.data,descricao:'Reembolso de km – '+r.descricao,qtd:r.km,unit:r.valor_km,valor:r.valor,reembolso_id:r.id}))].sort((a,b)=>String(a.data).localeCompare(String(b.data)))],
  q=t=>at.filter(x=>t(x.tipo)).reduce((s,x)=>s+x.n,0),tot=q(()=>true);
- return{client_id:cl.id,cliente:cl.fantasia,razao:cl.razao,cnpj:cl.cnpj,ano,mes,mensalidade:mens,despesas:dsp,reembolsos:rbv,custo_prof:custo,reembolsos_aguardando:{pendentes:ag.pend,aprovados:ag.apr,valor:R2(ag.v)},total:Math.round((mens+dsp)*100)/100,itens,pendentes:pend,
+ return{client_id:cl.id,cliente:cl.fantasia,razao:cl.razao,cnpj:cl.cnpj,ano,mes,mensalidade:mens,mens_calc:MC,despesas:dsp,reembolsos:rbv,custo_prof:custo,reembolsos_aguardando:{pendentes:ag.pend,aprovados:ag.apr,valor:R2(ag.v)},total:Math.round((mens+dsp)*100)/100,itens,pendentes:pend,
   atendimentos:{total:tot,psicologico:q(t=>t==='Psicológico'),social:q(t=>t==='Social'),outros:q(t=>t!=='Psicológico'&&t!=='Social'),horas:Math.round(at.reduce((s,x)=>s+(x.m||0),0)/60*100)/100}}}
 const perOk=c=>{const ano=+c.q.get('ano')||+c.body.ano,mes=+c.q.get('mes')||+c.body.mes;if(!(mes>=1&&mes<=12&&ano>=2000&&ano<=2100))throw E(400,'Período inválido.');return[ano,mes]};
 R('GET','/api/faturamentos/previa',GEST,c=>{const cl=getCl(c.q.get('client_id')),[ano,mes]=perOk(c);return{...faturaCalc(cl,ano,mes),ja_fechado:!!fatDoMes(cl.id,ymOf(ano,mes))}});
@@ -602,7 +619,9 @@ function fecharCliente(c,cl,ano,mes,obs){
  db.exec('BEGIN');try{const r=db.prepare('INSERT INTO faturamentos(client_id,ano,mes,mensalidade,despesas,reembolsos,custo_prof,total,qtd_atend,qtd_psico,qtd_social,horas,itens,obs,criado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(cl.id,ano,mes,f.mensalidade,f.despesas,f.reembolsos,f.custo_prof,f.total,a.total,a.psicologico,a.social,a.horas,JSON.stringify(f.itens),String(obs||'').slice(0,500),now());id=Number(r.lastInsertRowid);
   const rids=f.itens.filter(i=>i.reembolso_id).map(i=>+i.reembolso_id);if(rids.length)db.prepare('UPDATE reembolsos SET fat_id=? WHERE id IN ('+rids.join(',')+')').run(id);
   db.prepare('UPDATE despesas SET fat_id=? WHERE client_id=? AND fat_id IS NULL AND substr(data,1,7)=?').run(id,cl.id,ymOf(ano,mes));fatHist(c.u,{client_id:cl.id,ano,mes,total:f.total},'fechado');db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}
- audit(c.u,'faturamento_fechado',id+':'+cl.id,c.ip);return{id,total:f.total,atendimentos:a.total,pendentes:f.pendentes}}
+ audit(c.u,'faturamento_fechado',id+':'+cl.id,c.ip);
+ let exc=null;if(cl.limite_atend_mes&&!excDoMes(cl.id,ano,mes)){try{exc=fecharExc(c,cl,ano,mes,false,'Gerado automaticamente no fechamento do mês',true)}catch(e){if(e.status!==400)console.error(e);exc={erro:e.message}}}
+ return{id,total:f.total,atendimentos:a.total,pendentes:f.pendentes,excedente:exc}}
 R('POST','/api/faturamentos',GEST,c=>{need(c,'client_id','ano','mes');const[ano,mes]=perOk(c);return fecharCliente(c,getCl(c.body.client_id),ano,mes,c.body.obs)});
 /* Fechar o mês de vários clientes de uma vez: sem client_ids = todos os clientes ativos ainda em aberto. Cada cliente é fechado em sua própria transação. */
 R('POST','/api/faturamentos/lote',GEST,c=>{const[ano,mes]=perOk(c),ym=ymOf(ano,mes),ids=Array.isArray(c.body.client_ids)?c.body.client_ids.map(Number):null,out={fechados:[],ignorados:[],erros:[],total:0};
@@ -624,9 +643,10 @@ R('GET','/api/faturamentos',GEST,()=>db.prepare('SELECT f.*,c.fantasia FROM fatu
 R('POST','/api/faturamentos/:id/faturar',GEST,c=>{const r=db.prepare("UPDATE faturamentos SET status='Faturado',faturado_em=?,nf=? WHERE id=? AND status='Fechado'").run(now(),String(c.body.nf||'').slice(0,40),c.params.id);if(!r.changes)throw E(409,'Já faturado ou inexistente.');audit(c.u,'faturamento_faturado',c.params.id,c.ip);return{ok:1}});
 /* Reabrir: desfaz o fechamento do cliente naquele mês (as despesas voltam a ficar em aberto e o mês pode ser fechado de novo).
    Fechamento já FATURADO só é reaberto com confirmação explícita e motivo; fica registrado no histórico e na auditoria. */
-function reabrirFat(c,f,motivo,confirmar){const m=String(motivo||'').trim().slice(0,300);
+function reabrirFat(c,f,motivo,confirmar){const m=String(motivo||'').trim().slice(0,300),fx=excDoMes(f.client_id,f.ano,f.mes);
+ if(fx&&db.prepare("SELECT COUNT(*) n FROM cobr_colab WHERE exc_id=? AND status='Pago'").get(fx.id).n)throw E(423,'Há cobranças de atendimento extra deste mês já pagas por colaboradores. Desfaça esses pagamentos (Faturamento de excedente) antes de reabrir.');
  if(f.status==='Faturado'){if(confirmar!==true)throw E(423,'Fechamento já faturado'+(f.nf?' (NF '+f.nf+')':'')+': confirme a reabertura.');if(m.length<5)throw E(400,'Informe o motivo da reabertura (mínimo de 5 caracteres): este fechamento já foi faturado.')}
- db.exec('BEGIN');try{fatHist(c.u,f,'reaberto',m);db.prepare('UPDATE despesas SET fat_id=NULL WHERE fat_id=?').run(f.id);db.prepare('UPDATE reembolsos SET fat_id=NULL WHERE fat_id=?').run(f.id);db.prepare('DELETE FROM faturamentos WHERE id=?').run(f.id);db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}
+ db.exec('BEGIN');try{if(fx)reabrirExc(c,fx,'junto com o fechamento do mês');fatHist(c.u,f,'reaberto',m);db.prepare('UPDATE despesas SET fat_id=NULL WHERE fat_id=?').run(f.id);db.prepare('UPDATE reembolsos SET fat_id=NULL WHERE fat_id=?').run(f.id);db.prepare('DELETE FROM faturamentos WHERE id=?').run(f.id);db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}
  audit(c.u,'faturamento_reaberto',f.id+':'+f.client_id+':'+ymOf(f.ano,f.mes)+':'+f.status,c.ip)}
 const getFat=id=>{const f=db.prepare('SELECT * FROM faturamentos WHERE id=?').get(id);if(!f)throw E(404,'Fechamento não encontrado.');return f};
 R('POST','/api/faturamentos/:id/cancelar',GEST,c=>{const f=getFat(c.params.id);if(f.status!=='Fechado')throw E(423,'Fechamento já faturado: use "Reabrir" e informe o motivo.');reabrirFat(c,f,'',false);return{ok:1}});
@@ -707,30 +727,50 @@ function impostosExc(base,ano,mes,repassar){const imp=getImp(),sim=imp.regime===
  const aliq=Math.round(comp.reduce((s,x)=>s+(+x[1]||0),0)*10000)/10000;if(aliq>=60)throw E(400,'Alíquota total de impostos inválida (≥ 60%). Revise em DRE → Impostos.');
  const total=R2(repassar?base/(1-aliq/100):base),itens=comp.map(([n,a])=>({imposto:n,aliquota:Math.round(a*10000)/10000,valor:R2(total*a/100)}));
  return{regime:sim?'Simples Nacional':'Lucro Presumido',aliquota:aliq,impostos:itens,total_impostos:R2(itens.reduce((s,x)=>s+x.valor,0)),total}}
-function excCalc(cl,ano,mes,repassar){const ym=ymOf(ano,mes),pes=atendPessoas(ym,cl.id,false).filter(p=>p.excedente>0),qtd=pes.reduce((s,p)=>s+p.excedente,0),unit=R2(cl.valor_excedente||0),serv=R2(qtd*unit),t=impostosExc(serv,ano,mes,repassar);
+function excCalc(cl,ano,mes,repassar){const ym=ymOf(ano,mes),pes=atendPessoas(ym,cl.id,false).filter(p=>p.excedente>0),qtd=pes.reduce((s,p)=>s+p.excedente,0),unit=R2(cl.valor_excedente>0?cl.valor_excedente:getTab().extra),serv=R2(qtd*unit),t=impostosExc(serv,ano,mes,repassar);
  return{client_id:cl.id,cliente:cl.fantasia,razao:cl.razao,cnpj:cl.cnpj,ano,mes,limite:cl.limite_atend_mes||0,pessoas:pes.length,qtd_excedente:qtd,valor_unit:unit,valor_servico:serv,repassar:!!repassar,...t,
-  itens:pes.map((p,i)=>({pessoa:'Pessoa '+(i+1),qtd:p.qtd,limite:p.limite,excedente:p.excedente,valor:R2(p.excedente*unit),ref:(p.dep_id?'d':'c')+(p.dep_id||p.colab_id||0)}))}}
+  itens:pes.map((p,i)=>({pessoa:'Pessoa '+(i+1),qtd:p.qtd,limite:p.limite,excedente:p.excedente,valor:R2(p.excedente*unit),ref:(p.dep_id?'d':'c')+(p.dep_id||p.colab_id||0),colab_id:p.colab_id||null}))}}
 const excDoMes=(cid,ano,mes)=>db.prepare('SELECT * FROM fat_excedente WHERE client_id=? AND ano=? AND mes=?').get(cid,ano,mes);
-const excOut=f=>({...f,impostos:JSON.parse(f.impostos||'[]'),itens:JSON.parse(f.itens||'[]').map(({ref,...x})=>x),repassar:!!f.repassar});
-const simNao=v=>!(v===false||v===0||v==='0'||v==='false');
+const excOut=f=>({...f,impostos:JSON.parse(f.impostos||'[]'),itens:JSON.parse(f.itens||'[]').map(({ref,colab_id,...x})=>x),repassar:!!f.repassar});
 /* situação do mês de todos os clientes com limite cadastrado (ou com fechamento de excedente no mês) */
 R('GET','/api/fat-excedente',GEST,c=>{const[ano,mes]=perOk(c);
  return db.prepare('SELECT * FROM clients ORDER BY fantasia').all().map(cl=>{const f=excDoMes(cl.id,ano,mes);if(f)return{...excOut(f),cliente:cl.fantasia,situacao:f.status};
-  if(!cl.ativo||!cl.limite_atend_mes)return null;const p=excCalc(cl,ano,mes,true);return{...p,id:null,situacao:p.qtd_excedente?(p.valor_unit?'Em aberto':'Sem valor cadastrado'):'Sem excedente'}}).filter(Boolean)});
-R('GET','/api/fat-excedente/previa',GEST,c=>{const cl=getCl(c.q.get('client_id')),[ano,mes]=perOk(c);return{...excCalc(cl,ano,mes,simNao(c.q.get('repassar')??'1')),ja_fechado:!!excDoMes(cl.id,ano,mes)}});
-R('POST','/api/fat-excedente',GEST,c=>{need(c,'client_id','ano','mes');const[ano,mes]=perOk(c),cl=getCl(c.body.client_id);if(excDoMes(cl.id,ano,mes))throw E(409,'O excedente deste mês já foi fechado para este cliente.');
- if(!cl.limite_atend_mes)throw E(400,'Cadastre o limite de atendimentos por pessoa no cliente.');const f=excCalc(cl,ano,mes,simNao(c.body.repassar??true));
- if(!f.qtd_excedente)throw E(400,'Não há atendimentos acima do limite neste mês.');if(!f.valor_unit)throw E(400,'Cadastre o valor por atendimento excedente no cliente.');
- const r=db.prepare('INSERT INTO fat_excedente(client_id,ano,mes,limite,pessoas,qtd_excedente,valor_unit,valor_servico,regime,aliquota,impostos,total_impostos,repassar,total,itens,obs,criado,criado_por) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(cl.id,ano,mes,f.limite,f.pessoas,f.qtd_excedente,f.valor_unit,f.valor_servico,f.regime,f.aliquota,JSON.stringify(f.impostos),f.total_impostos,f.repassar?1:0,f.total,JSON.stringify(f.itens),String(c.body.obs||'').slice(0,500),now(),c.u.id);
- audit(c.u,'excedente_fechado',r.lastInsertRowid+':'+cl.id+':'+ymOf(ano,mes)+':'+f.total,c.ip);return{id:Number(r.lastInsertRowid),total:f.total}});
+  if(!cl.ativo||!cl.limite_atend_mes)return null;const p=excCalc(cl,ano,mes,false);return{...p,itens:p.itens.map(({ref,colab_id,...x})=>x),id:null,situacao:p.qtd_excedente?'Em aberto':'Sem excedente'}}).filter(Boolean)});
+R('GET','/api/fat-excedente/previa',GEST,c=>{const cl=getCl(c.q.get('client_id')),[ano,mes]=perOk(c);const p=excCalc(cl,ano,mes,simNao(c.q.get('repassar')??'0'));return{...p,itens:p.itens.map(({ref,colab_id,...x})=>x),ja_fechado:!!excDoMes(cl.id,ano,mes)}});
+/* Cobranças do atendimento extra: uma por colaborador (titular) por mês; o extra de dependente é cobrado do titular. */
+db.exec(`CREATE TABLE IF NOT EXISTS cobr_colab(id INTEGER PRIMARY KEY,exc_id INTEGER,client_id INTEGER,colab_id INTEGER,ano INTEGER,mes INTEGER,qtd INTEGER,valor_unit REAL,valor REAL,status TEXT DEFAULT 'A cobrar',forma TEXT,pago_em TEXT,obs TEXT,criado TEXT,UNIQUE(exc_id,colab_id))`);
+function fecharExc(c,cl,ano,mes,repassar,obs,auto){if(excDoMes(cl.id,ano,mes))throw E(409,'O excedente deste mês já foi fechado para este cliente.');
+ if(!cl.limite_atend_mes)throw E(400,'Cadastre o limite de atendimentos por pessoa no cliente.');const f=excCalc(cl,ano,mes,repassar);
+ if(!f.qtd_excedente)throw E(400,'Não há atendimentos acima do limite neste mês.');if(!f.valor_unit)throw E(400,'Cadastre o valor do atendimento extra na tabela de preços.');
+ return tx(()=>{const r=db.prepare('INSERT INTO fat_excedente(client_id,ano,mes,limite,pessoas,qtd_excedente,valor_unit,valor_servico,regime,aliquota,impostos,total_impostos,repassar,total,itens,obs,criado,criado_por) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(cl.id,ano,mes,f.limite,f.pessoas,f.qtd_excedente,f.valor_unit,f.valor_servico,f.regime,f.aliquota,JSON.stringify(f.impostos),f.total_impostos,f.repassar?1:0,f.total,JSON.stringify(f.itens),String(obs||'').slice(0,500),now(),c.u.id),id=Number(r.lastInsertRowid);
+  const g=new Map();for(const i of f.itens){const k=i.colab_id||0;g.set(k,(g.get(k)||0)+i.excedente)}
+  const fat=f.valor_servico?f.total/f.valor_servico:1;/* com impostos acrescidos, cada cobrança recebe o mesmo acréscimo proporcional */
+  for(const[k,q]of g)db.prepare('INSERT INTO cobr_colab(exc_id,client_id,colab_id,ano,mes,qtd,valor_unit,valor,criado) VALUES(?,?,?,?,?,?,?,?,?)').run(id,cl.id,k||null,ano,mes,q,f.valor_unit,R2(q*f.valor_unit*fat),now());
+  audit(c.u,auto?'excedente_fechado_auto':'excedente_fechado',id+':'+cl.id+':'+ymOf(ano,mes)+':'+f.total,c.ip);return{id,total:f.total,cobrancas:g.size}})}
+R('POST','/api/fat-excedente',GEST,c=>{need(c,'client_id','ano','mes');const[ano,mes]=perOk(c);return fecharExc(c,getCl(c.body.client_id),ano,mes,simNao(c.body.repassar??false),c.body.obs)});
+/* reabre o excedente (apaga fechamento e cobranças) se nenhuma cobrança já foi paga */
+function reabrirExc(c,f,motivo){const pg=db.prepare("SELECT COUNT(*) n FROM cobr_colab WHERE exc_id=? AND status='Pago'").get(f.id).n;
+ if(pg)throw E(423,pg+' cobrança(s) de colaborador deste excedente já foram pagas. Desfaça o pagamento antes de reabrir.');
+ db.prepare('DELETE FROM cobr_colab WHERE exc_id=?').run(f.id);db.prepare('DELETE FROM fat_excedente WHERE id=?').run(f.id);audit(c.u,'excedente_reaberto',f.id+':'+f.client_id+':'+ymOf(f.ano,f.mes)+':'+f.status+(motivo?':'+motivo:''),c.ip)}
 const getExc=id=>{const f=db.prepare('SELECT * FROM fat_excedente WHERE id=?').get(id);if(!f)throw E(404,'Fechamento de excedente não encontrado.');return f};
 R('POST','/api/fat-excedente/:id/faturar',GEST,c=>{const r=db.prepare("UPDATE fat_excedente SET status='Faturado',faturado_em=?,nf=? WHERE id=? AND status='Fechado'").run(now(),String(c.body.nf||'').slice(0,40),c.params.id);if(!r.changes)throw E(409,'Já faturado ou inexistente.');audit(c.u,'excedente_faturado',c.params.id,c.ip);return{ok:1}});
 R('POST','/api/fat-excedente/:id/reabrir',GEST,c=>{const f=getExc(c.params.id),m=String(c.body.motivo||'').trim().slice(0,300);
  if(f.status==='Faturado'&&m.length<5)throw E(400,'Este excedente já foi faturado'+(f.nf?' (NF '+f.nf+')':'')+': informe o motivo da reabertura (mínimo de 5 caracteres).');
- db.prepare('DELETE FROM fat_excedente WHERE id=?').run(f.id);audit(c.u,'excedente_reaberto',f.id+':'+f.client_id+':'+ymOf(f.ano,f.mes)+':'+f.status+(m?':'+m:''),c.ip);return{ok:1}});
+ tx(()=>reabrirExc(c,f,m));return{ok:1}});
+/* cobranças dos colaboradores (atendimento extra): lista com nome para quem cobra (gestão), pagamento e cancelamento */
+R('GET','/api/cobrancas',GEST,c=>{const[ano,mes]=perOk(c),cid=+c.q.get('client_id')||0,cn=Object.fromEntries(db.prepare('SELECT id,fantasia FROM clients').all().map(k=>[k.id,k.fantasia]));
+ return db.prepare('SELECT b.*,k.nome_enc,k.cpf_enc FROM cobr_colab b LEFT JOIN colaboradores k ON k.id=b.colab_id WHERE b.ano=? AND b.mes=?'+(cid?' AND b.client_id='+cid:'')+' ORDER BY b.client_id,b.id').all(ano,mes)
+  .map(b=>({id:b.id,exc_id:b.exc_id,client_id:b.client_id,empresa:cn[b.client_id]||'',colab_id:b.colab_id,colaborador:b.colab_id?sdec(b.nome_enc):'Sem identificação',cpf:maskCpf(sdec(b.cpf_enc)),qtd:b.qtd,valor_unit:b.valor_unit,valor:b.valor,status:b.status,forma:b.forma,pago_em:b.pago_em,obs:b.obs}))});
+const getCob=id=>{const b=db.prepare('SELECT * FROM cobr_colab WHERE id=?').get(id);if(!b)throw E(404,'Cobrança não encontrada.');return b};
+R('POST','/api/cobrancas/:id/pagar',GEST,c=>{const b=getCob(c.params.id);if(b.status!=='A cobrar')throw E(409,'Só cobranças "A cobrar" podem ser marcadas como pagas.');
+ db.prepare("UPDATE cobr_colab SET status='Pago',forma=?,pago_em=? WHERE id=?").run(String(c.body.forma||'').slice(0,40)||null,/^\d{4}-\d\d-\d\d$/.test(c.body.data||'')?c.body.data:brHoje(),b.id);audit(c.u,'cobranca_paga',b.id,c.ip);return{ok:1}});
+R('POST','/api/cobrancas/:id/desfazer',GEST,c=>{const b=getCob(c.params.id);if(b.status==='A cobrar')throw E(409,'Esta cobrança já está em aberto.');db.prepare("UPDATE cobr_colab SET status='A cobrar',forma=NULL,pago_em=NULL,obs=NULL WHERE id=?").run(b.id);audit(c.u,'cobranca_reaberta',b.id+':'+b.status,c.ip);return{ok:1}});
+R('POST','/api/cobrancas/:id/cancelar',GEST,c=>{const b=getCob(c.params.id),m=String(c.body.motivo||'').trim();if(b.status!=='A cobrar')throw E(409,'Só cobranças em aberto podem ser canceladas.');if(m.length<5)throw E(400,'Informe o motivo do cancelamento (mínimo de 5 caracteres).');
+ db.prepare("UPDATE cobr_colab SET status='Cancelado',obs=? WHERE id=?").run(m.slice(0,300),b.id);audit(c.u,'cobranca_cancelada',b.id+':'+m.slice(0,100),c.ip);return{ok:1}});
 R('GET','/api/export/fat-excedente/:id.xlsx',GEST,c=>{const f0=getExc(c.params.id),cl=getCl(f0.client_id),f=excOut(f0),per=String(f.mes).padStart(2,'0')+'/'+f.ano;audit(c.u,'exportacao','fat-excedente-'+f.id+'.xlsx',c.ip);
  return FX(c,`excedente-${f.ano}-${String(f.mes).padStart(2,'0')}-${String(cl.fantasia||'cliente').replace(/[^\w-]+/g,'_')}.xlsx`,[{nome:'Resumo',cols:[{h:'Item',w:44},{h:'Valor',w:30}],rows:[['Cliente',cl.fantasia],['Razão social',cl.razao],['CNPJ',cl.cnpj],['Período',per],['Limite de atendimentos por pessoa no mês',f.limite],['Pessoas acima do limite',f.pessoas],['Atendimentos excedentes',f.qtd_excedente],['Valor por atendimento excedente','R$ '+f.valor_unit.toFixed(2)],['Valor do serviço','R$ '+f.valor_servico.toFixed(2)],['Regime de impostos',f.regime+' (alíquota total '+String(f.aliquota).replace('.',',')+'%)'],['Impostos '+(f.repassar?'acrescidos ao valor':'destacados no valor'),'R$ '+f.total_impostos.toFixed(2)],['Total a faturar','R$ '+f.total.toFixed(2)],['Situação',f.status+(f.nf?' · NF '+f.nf:'')]]},
   {nome:'Impostos',cols:[{h:'Imposto',w:44},{h:'Alíquota (%)',t:'n'},{h:'Valor',t:'m'}],rows:f.impostos.map(i=>[i.imposto,i.aliquota,i.valor])},
+  {nome:'Cobranças (uso interno)',cols:[{h:'Colaborador',w:34},{h:'CPF',w:18},{h:'Atendimentos extras',t:'n'},{h:'Valor',t:'m'},{h:'Situação',w:12},{h:'Pago em',t:'d'}],rows:db.prepare('SELECT b.*,k.nome_enc,k.cpf_enc FROM cobr_colab b LEFT JOIN colaboradores k ON k.id=b.colab_id WHERE b.exc_id=? ORDER BY b.id').all(f.id).map(b=>[b.colab_id?sdec(b.nome_enc):'Sem identificação',maskCpf(sdec(b.cpf_enc)),b.qtd,b.valor,b.status,b.pago_em])},
   {nome:'Excedente por pessoa',cols:[{h:'Pessoa (sem identificação, por sigilo)',w:36},{h:'Atendimentos no mês',t:'n'},{h:'Limite',t:'n'},{h:'Excedente',t:'n'},{h:'Valor',t:'m'}],rows:f.itens.map(i=>[i.pessoa,i.qtd,i.limite,i.excedente,i.valor])}])});
 /* ---------- servidor ---------- */
 /* ---------- PLANO DE NEGÓCIOS (v9): premissas, custos da estrutura e evolução por fases ----------
