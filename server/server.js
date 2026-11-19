@@ -76,6 +76,8 @@ if(!db.prepare("SELECT 1 FROM settings WHERE k='dre_bf1'").get()){
   db.prepare('UPDATE faturamentos SET reembolsos=?,custo_prof=? WHERE id=?').run(rb,Math.round(cp*100)/100,f.id)}
  db.prepare("INSERT OR REPLACE INTO settings(k,v) VALUES('dre_bf1',?)").run(now())}
 for(const d of db.prepare("SELECT id,nasc FROM dependentes WHERE nasc IS NOT NULL AND nasc<>'' AND (nasc_enc IS NULL OR nasc_enc='')").all())db.prepare("UPDATE dependentes SET nasc_enc=?,nasc='' WHERE id=?").run(enc(d.nasc),d.id);
+/* ---------- v10: limite de atendimentos por pessoa no mês (contrato do cliente) e valor do excedente ---------- */
+for(const a of['ALTER TABLE clients ADD COLUMN limite_atend_mes INTEGER DEFAULT 0','ALTER TABLE clients ADD COLUMN valor_excedente REAL DEFAULT 0'])try{db.exec(a)}catch(e){}
 /* ---------- infra ---------- */
 const audit=(u,acao,alvo,ip,ok=1)=>db.prepare('INSERT INTO audit(ts,user_id,acao,alvo,ip,ok) VALUES(?,?,?,?,?,?)').run(now(),u?u.id:null,acao,String(alvo??''),ip,ok);
 const E=(s,m)=>Object.assign(new Error(m),{status:s});
@@ -101,12 +103,29 @@ R('GET','/api/clients',['admin'],()=>db.prepare('SELECT * FROM clients ORDER BY 
 const num=(v,max=1e7,dec=2)=>{const n=+String(v??0).replace(',','.');if(!Number.isFinite(n)||n<0||n>max)throw E(400,'Valor numérico inválido.');const f=10**dec;return Math.round(n*f)/f};
 const PLANOS_OK=['Essencial','Equilíbrio','Completo'];
 R('POST','/api/clients',['admin'],c=>{need(c,'cnpj','razao');const b=c.body;
- try{const r=db.prepare('INSERT INTO clients(cnpj,razao,fantasia,endereco,responsavel,contato,mensalidade,valor_km,plano,funcionarios,preco_func,inicio_contrato,criado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(b.cnpj,b.razao,b.fantasia||b.razao,b.endereco||'',b.responsavel||'',b.contato||'',num(b.mensalidade),num(b.valor_km,1e4,4),PLANOS_OK.includes(b.plano)?b.plano:null,Math.round(num(b.funcionarios,1e5,0)),num(b.preco_func,1e4,2),/^\d{4}-\d{2}(-\d{2})?$/.test(b.inicio_contrato||'')?String(b.inicio_contrato).slice(0,7):null,now());audit(c.u,'cliente_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}}
+ try{const r=db.prepare('INSERT INTO clients(cnpj,razao,fantasia,endereco,responsavel,contato,mensalidade,valor_km,plano,funcionarios,preco_func,inicio_contrato,limite_atend_mes,valor_excedente,criado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(b.cnpj,b.razao,b.fantasia||b.razao,b.endereco||'',b.responsavel||'',b.contato||'',num(b.mensalidade),num(b.valor_km,1e4,4),PLANOS_OK.includes(b.plano)?b.plano:null,Math.round(num(b.funcionarios,1e5,0)),num(b.preco_func,1e4,2),/^\d{4}-\d{2}(-\d{2})?$/.test(b.inicio_contrato||'')?String(b.inicio_contrato).slice(0,7):null,Math.round(num(b.limite_atend_mes,1000,0)),num(b.valor_excedente,1e5,2),now());audit(c.u,'cliente_criado',r.lastInsertRowid,c.ip);return{id:Number(r.lastInsertRowid)}}
  catch(e){if(/UNIQUE/.test(e.message))throw E(409,'Já existe um cliente com este CNPJ.');throw e}});
-R('PATCH','/api/clients/:id',['admin'],c=>{const b={...c.body},f=['razao','fantasia','endereco','responsavel','contato','ativo','mensalidade','valor_km','plano','funcionarios','preco_func','inicio_contrato'].filter(k=>k in b);if(!f.length)throw E(400,'Nada a alterar');
+R('PATCH','/api/clients/:id',['admin'],c=>{const b={...c.body},f=['razao','fantasia','endereco','responsavel','contato','ativo','mensalidade','valor_km','plano','funcionarios','preco_func','inicio_contrato','limite_atend_mes','valor_excedente'].filter(k=>k in b);if(!f.length)throw E(400,'Nada a alterar');
+ if('limite_atend_mes' in b)b.limite_atend_mes=Math.round(num(b.limite_atend_mes,1000,0));if('valor_excedente' in b)b.valor_excedente=num(b.valor_excedente,1e5,2);
  if('plano' in b&&!PLANOS_OK.includes(b.plano))b.plano=null;if('funcionarios' in b)b.funcionarios=Math.round(num(b.funcionarios,1e5,0));if('preco_func' in b)b.preco_func=num(b.preco_func,1e4,2);if('inicio_contrato' in b)b.inicio_contrato=/^\d{4}-\d{2}/.test(b.inicio_contrato||'')?String(b.inicio_contrato).slice(0,7):null;
  if('mensalidade' in b)b.mensalidade=num(b.mensalidade);if('valor_km' in b)b.valor_km=num(b.valor_km,1e4,4);
  db.prepare(`UPDATE clients SET ${f.map(k=>k+'=?').join(',')} WHERE id=?`).run(...f.map(k=>b[k]),c.params.id);audit(c.u,'cliente_editado',c.params.id+':'+f.join(','),c.ip);return{ok:1}});
+/* Atendimentos por pessoa no mês x limite do contrato do cliente (base para cobrar o excedente).
+   Pessoa = dependente (se o atendimento foi de um dependente) ou colaborador. Atendimentos cancelados não contam.
+   GET /api/relatorios/atend-pessoa?ano=2026&mes=11[&client_id=3] */
+const sdec=s=>{try{return dec(s)}catch(e){return''}};
+R('GET','/api/relatorios/atend-pessoa',['admin'],c=>{const hj=new Date(),ano=+c.q.get('ano')||hj.getFullYear(),mes=+c.q.get('mes')||hj.getMonth()+1,cid=+c.q.get('client_id')||0;
+ if(mes<1||mes>12||ano<2000||ano>2100)throw E(400,'Mês inválido.');const ym=ano+'-'+String(mes).padStart(2,'0');
+ const cl=Object.fromEntries(db.prepare('SELECT id,fantasia,limite_atend_mes,valor_excedente FROM clients').all().map(k=>[k.id,k]));
+ const rows=db.prepare(`SELECT a.client_id,COALESCE(a.colab_id,p.colab_id) colab_id,a.dep_id,COUNT(*) qtd,SUM(CASE WHEN a.status IN ('Aprovado','Fechado') THEN 1 ELSE 0 END) validados
+  FROM atend a LEFT JOIN prontuarios p ON p.id=a.pront_id WHERE substr(a.data,1,7)=? AND a.status<>'Cancelado'${cid?' AND a.client_id=?':''}
+  GROUP BY a.client_id,COALESCE(a.colab_id,p.colab_id),a.dep_id`).all(...(cid?[ym,cid]:[ym]));
+ const kn=new Map(),dn=new Map(),nome=(m,sql,id)=>{if(!id)return'';if(!m.has(id)){const r=db.prepare(sql).get(id);m.set(id,r?sdec(r.nome_enc):'')}return m.get(id)};
+ const out=rows.map(r=>{const k=cl[r.client_id]||{},lim=k.limite_atend_mes||0,exc=lim?Math.max(0,r.qtd-lim):0,colab=nome(kn,'SELECT nome_enc FROM colaboradores WHERE id=?',r.colab_id),dep=nome(dn,'SELECT nome_enc FROM dependentes WHERE id=?',r.dep_id);
+  return{client_id:r.client_id,empresa:k.fantasia||'',colab_id:r.colab_id,dep_id:r.dep_id,pessoa:r.dep_id?(dep||'Dependente')+' (dependente de '+(colab||'—')+')':(colab||'Sem identificação'),qtd:r.qtd,validados:r.validados,limite:lim,excedente:exc,valor_excedente:k.valor_excedente||0,valor:Math.round(exc*(k.valor_excedente||0)*100)/100}})
+  .sort((a,b)=>b.excedente-a.excedente||a.empresa.localeCompare(b.empresa)||b.qtd-a.qtd||a.pessoa.localeCompare(b.pessoa));
+ audit(c.u,'relatorio_atend_pessoa',ym+(cid?' cliente '+cid:''),c.ip);
+ return{ano,mes,pessoas:out,total_atend:out.reduce((s,r)=>s+r.qtd,0),pessoas_acima:out.filter(r=>r.excedente>0).length,total_excedente:out.reduce((s,r)=>s+r.excedente,0),valor_excedente:Math.round(out.reduce((s,r)=>s+r.valor,0)*100)/100}});
 /* ---------- usuários / profissionais (admin) ---------- */
 R('GET','/api/users',['admin'],()=>db.prepare('SELECT id,nome,email,usuario,tel,role,registro,valor_hora,inicio,ativo,client_id FROM users').all());
 const EMAIL_RE=/^[^@\s]+@[^@\s]+\.[^@\s]+$/,LOGIN_RE=/^[a-z0-9._-]{3,40}$/i;
